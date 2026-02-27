@@ -1,0 +1,59 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "WebFetch",
+      "WebSearch"
+    ],
+    "deny": [
+      "rm -rf /",
+      "rm -rf ~",
+      "DROP TABLE",
+      "DROP DATABASE",
+      "git push --force origin main",
+      "chmod 777",
+      "curl * | bash",
+      "wget * | sh"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/scripts/secret-scanner.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/scripts/command-guard.js"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/scripts/session-save.js"
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "TAVILY_MCP_URL": "https://mcp.tavily.com/mcp/?tavilyApiKey=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",
+    "REKA_API_KEY": "f1a9fc5003ed55af3a7f5f03ed5abafec5b2414afb8331a95e232326e2abbb3e",
+    "MODULATE_API_KEY": "3f5e11e3-a96d-4f70-9608-3c138c49842f"
+  }
+}
