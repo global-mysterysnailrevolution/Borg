@@ -87,7 +87,7 @@ class RekaClient:
             print(response.message.content)
     """
 
-    _CHAT_ENDPOINT = "/chat/completions"
+    _CHAT_ENDPOINT = "/chat"
 
     def __init__(self, config: ProviderConfig) -> None:
         self._config = config
@@ -149,16 +149,21 @@ class RekaClient:
         return response.json()
 
     def _parse_response(self, data: dict[str, Any]) -> RekaResponse:
-        """Convert raw API JSON into a :class:`RekaResponse`."""
-        choice = data.get("choices", [{}])[0]
-        msg = choice.get("message", {})
+        """Convert raw API JSON into a :class:`RekaResponse`.
+
+        Reka's API returns a ``responses`` array (not ``choices``).  Each
+        element has ``finish_reason`` and ``message`` with ``role`` /
+        ``content`` fields.
+        """
+        response_item = data.get("responses", [{}])[0]
+        msg = response_item.get("message", {})
         return RekaResponse(
             model=data.get("model", ""),
             message=RekaMessage(
                 role=msg.get("role", "assistant"),
                 content=msg.get("content", ""),
             ),
-            finish_reason=choice.get("finish_reason"),
+            finish_reason=response_item.get("finish_reason"),
             usage=data.get("usage"),
         )
 

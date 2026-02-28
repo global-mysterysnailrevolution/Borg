@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "tavily": {
+      "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}"
+    },
+    "yutori": {
+      "command": "uvx",
+      "args": ["yutori-mcp"]
+    },
+    "fastino": {
+      "command": "uvx",
+      "args": ["--from", "./mcp-servers/fastino-mcp", "fastino-mcp"]
+    }
+  }
+}

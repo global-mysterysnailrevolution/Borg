@@ -88,6 +88,87 @@ class APIEndpointNode(BaseModel):
         return self.model_dump()
 
 
+class DiscoveryEventNode(BaseModel):
+    """Represents a single discovery action — scraping a URL for tools.
+
+    Each run of :meth:`LinkIntelEngine.analyze_url` (or equivalent) should
+    produce exactly one ``DiscoveryEvent`` node.
+    """
+
+    url: str
+    timestamp: str = ""  # ISO-8601; auto-set by Cypher datetime() if empty
+    source_type: str = "manual"  # "luma" | "youtube" | "instagram" | "manual"
+    engine_used: str = ""  # e.g. "link_intel", "reel_scout", "video_intel"
+    entity_count: int = 0  # number of entities extracted in this run
+
+    @field_validator("source_type")
+    @classmethod
+    def _valid_source_type(cls, v: str) -> str:
+        allowed = {"luma", "youtube", "instagram", "manual", ""}
+        if v not in allowed:
+            raise ValueError(f"source_type must be one of {allowed}, got {v!r}")
+        return v
+
+    def to_cypher_params(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+class IntegrationEventNode(BaseModel):
+    """Represents when a tool was integrated into the harness.
+
+    Tracks the method used (MCP, REST client, manual wiring) and whether
+    the integration succeeded.
+    """
+
+    timestamp: str = ""  # ISO-8601; auto-set by Cypher datetime() if empty
+    method: str = "manual"  # "mcp" | "rest" | "manual"
+    status: str = "pending"  # "success" | "failed" | "pending"
+    api_key_obtained: bool = False
+
+    @field_validator("method")
+    @classmethod
+    def _valid_method(cls, v: str) -> str:
+        allowed = {"mcp", "rest", "manual", ""}
+        if v not in allowed:
+            raise ValueError(f"method must be one of {allowed}, got {v!r}")
+        return v
+
+    @field_validator("status")
+    @classmethod
+    def _valid_status(cls, v: str) -> str:
+        allowed = {"success", "failed", "pending", ""}
+        if v not in allowed:
+            raise ValueError(f"status must be one of {allowed}, got {v!r}")
+        return v
+
+    def to_cypher_params(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+class AuditLogNode(BaseModel):
+    """Represents any significant action for the audit trail.
+
+    Examples of ``action`` values: ``"discovery_started"``,
+    ``"tool_integrated"``, ``"api_key_acquired"``, ``"tool_deleted"``.
+    """
+
+    timestamp: str = ""  # ISO-8601; auto-set by Cypher datetime() if empty
+    action: str  # free-form action identifier
+    actor: str = "hackforge"  # "hackforge" | "user"
+    details: str = ""  # human-readable description or JSON blob
+
+    @field_validator("actor")
+    @classmethod
+    def _valid_actor(cls, v: str) -> str:
+        allowed = {"hackforge", "user", ""}
+        if v not in allowed:
+            raise ValueError(f"actor must be one of {allowed}, got {v!r}")
+        return v
+
+    def to_cypher_params(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
 # ---------------------------------------------------------------------------
 # Relationship type registry
 # ---------------------------------------------------------------------------
@@ -106,7 +187,11 @@ RELATIONSHIPS: dict[str, str] = {
     # Technical structure
     "HAS_ENDPOINT": "Tool → APIEndpoint: the tool exposes this REST endpoint",
     # Provenance
-    "DISCOVERED_FROM": "Tool → URL source: where the tool was first found",
+    "DISCOVERED_FROM": "Tool → DiscoveryEvent: when/where the tool was first found",
+    # Integration tracking
+    "INTEGRATED_VIA": "Tool → IntegrationEvent: how the tool was set up",
+    # Audit trail
+    "LOGGED": "DiscoveryEvent|IntegrationEvent → AuditLog: audit trail link",
 }
 
 # Typed tuple for static analysis / documentation generation
@@ -138,6 +223,23 @@ SCHEMA_INIT_QUERIES: list[str] = [
     "FOR (t:Tool) ON (t.has_free_tier)",
     "CREATE INDEX vendor_sponsor IF NOT EXISTS "
     "FOR (v:Vendor) ON (v.hackathon_sponsor)",
+    # --- DiscoveryEvent / IntegrationEvent / AuditLog indexes ---
+    "CREATE INDEX discovery_event_url IF NOT EXISTS "
+    "FOR (d:DiscoveryEvent) ON (d.url)",
+    "CREATE INDEX discovery_event_timestamp IF NOT EXISTS "
+    "FOR (d:DiscoveryEvent) ON (d.timestamp)",
+    "CREATE INDEX discovery_event_source_type IF NOT EXISTS "
+    "FOR (d:DiscoveryEvent) ON (d.source_type)",
+    "CREATE INDEX integration_event_status IF NOT EXISTS "
+    "FOR (i:IntegrationEvent) ON (i.status)",
+    "CREATE INDEX integration_event_timestamp IF NOT EXISTS "
+    "FOR (i:IntegrationEvent) ON (i.timestamp)",
+    "CREATE INDEX audit_log_timestamp IF NOT EXISTS "
+    "FOR (a:AuditLog) ON (a.timestamp)",
+    "CREATE INDEX audit_log_action IF NOT EXISTS "
+    "FOR (a:AuditLog) ON (a.action)",
+    "CREATE INDEX audit_log_actor IF NOT EXISTS "
+    "FOR (a:AuditLog) ON (a.actor)",
     # --- Full-text search indexes ---
     "CREATE FULLTEXT INDEX tool_fulltext IF NOT EXISTS "
     "FOR (t:Tool) ON EACH [t.name, t.description]",
@@ -168,4 +270,7 @@ NODE_LABELS: dict[str, type[BaseModel]] = {
     node_label_for(VendorNode): VendorNode,
     node_label_for(CapabilityNode): CapabilityNode,
     node_label_for(APIEndpointNode): APIEndpointNode,
+    node_label_for(DiscoveryEventNode): DiscoveryEventNode,
+    node_label_for(IntegrationEventNode): IntegrationEventNode,
+    node_label_for(AuditLogNode): AuditLogNode,
 }

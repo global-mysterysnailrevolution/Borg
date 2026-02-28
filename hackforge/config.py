@@ -19,6 +19,17 @@ class ProviderConfig:
 
 
 @dataclass
+class AirbyteCloudConfig:
+    """Configuration for Airbyte Cloud API (OAuth client credentials)."""
+
+    client_id: str = ""
+    client_secret: str = ""
+    base_url: str = "https://api.airbyte.com/v1"
+    token_url: str = "https://api.airbyte.com/v1/applications/token"
+    timeout: int = 30
+
+
+@dataclass
 class HackForgeConfig:
     """All provider configurations in one place."""
 
@@ -35,7 +46,9 @@ class HackForgeConfig:
     modulate: ProviderConfig = field(default_factory=ProviderConfig)
     yutori: ProviderConfig = field(default_factory=ProviderConfig)
     airbyte: ProviderConfig = field(default_factory=ProviderConfig)
+    airbyte_cloud: AirbyteCloudConfig = field(default_factory=AirbyteCloudConfig)
     render: ProviderConfig = field(default_factory=ProviderConfig)
+    anthropic: ProviderConfig = field(default_factory=ProviderConfig)
 
     @classmethod
     def load(cls, project_root: Path | None = None) -> HackForgeConfig:
@@ -64,7 +77,7 @@ class HackForgeConfig:
         # Reka AI
         cfg.reka = ProviderConfig(
             api_key=get("REKA_API_KEY"),
-            base_url="https://api.reka.ai/v2",
+            base_url="https://api.reka.ai/v1",
             timeout=int(get("REKA_TIMEOUT") or "60"),
         )
 
@@ -101,10 +114,20 @@ class HackForgeConfig:
             timeout=int(get("YUTORI_TIMEOUT") or "120"),
         )
 
-        # Airbyte
+        # Airbyte (self-hosted)
         cfg.airbyte = ProviderConfig(
             api_key=get("AIRBYTE_API_KEY"),
             base_url=get("AIRBYTE_URL") or "http://localhost:8000/api/v1",
+            timeout=int(get("AIRBYTE_TIMEOUT") or "30"),
+        )
+
+        # Airbyte Cloud (OAuth client credentials)
+        cfg.airbyte_cloud = AirbyteCloudConfig(
+            client_id=get("AIRBYTE_CLIENT_ID"),
+            client_secret=get("AIRBYTE_CLIENT_SECRET"),
+            base_url=get("AIRBYTE_CLOUD_URL") or "https://api.airbyte.com/v1",
+            token_url=get("AIRBYTE_TOKEN_URL")
+            or "https://api.airbyte.com/v1/applications/token",
             timeout=int(get("AIRBYTE_TIMEOUT") or "30"),
         )
 
@@ -113,6 +136,13 @@ class HackForgeConfig:
             api_key=get("RENDER_API_KEY"),
             base_url="https://api.render.com/v1",
             timeout=int(get("RENDER_TIMEOUT") or "30"),
+        )
+
+        # Anthropic (for agentic integration)
+        cfg.anthropic = ProviderConfig(
+            api_key=get("ANTHROPIC_API_KEY"),
+            base_url="https://api.anthropic.com",
+            timeout=int(get("ANTHROPIC_TIMEOUT") or "120"),
         )
 
         return cfg

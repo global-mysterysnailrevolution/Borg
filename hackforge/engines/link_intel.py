@@ -18,6 +18,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from hackforge.config import HackForgeConfig
+from hackforge.pipeline_bus import PipelineBus
 from hackforge.providers.tavily_client import TavilyClient
 
 logger = logging.getLogger(__name__)
@@ -126,10 +127,11 @@ class LinkIntelEngine:
         print(report.model_dump_json(indent=2))
     """
 
-    def __init__(self, config: HackForgeConfig) -> None:
+    def __init__(self, config: HackForgeConfig, bus: PipelineBus | None = None) -> None:
         self._config = config
         self._tavily = TavilyClient(config.tavily)
         self._http: httpx.AsyncClient | None = None
+        self._bus = bus
 
     # ------------------------------------------------------------------
     # Public API
@@ -149,33 +151,75 @@ class LinkIntelEngine:
 
         try:
             # Step 1: scrape
-            page_text = await self._scrape_page(url)
+            if self._bus:
+                await self._bus.emit_step("link_intel", "scrape", f"Scraping {url}...")
+            page_text, page_title = await self._scrape_page(url)
+            if page_title:
+                report.page_title = page_title
             if not page_text:
                 logger.warning("No content retrieved for %s", url)
                 report.error = "Could not retrieve page content."
+                if self._bus:
+                    await self._bus.emit_error("link_intel", "scrape", f"No content from {url}")
                 return report
+            if self._bus:
+                await self._bus.emit_step(
+                    "link_intel", "scrape",
+                    f"Scraped {len(page_text)} chars" + (f' from "{page_title}"' if page_title else ""),
+                )
 
             # Step 2: extract entities
+            if self._bus:
+                await self._bus.emit_step("link_intel", "extract", "Extracting entities (Fastino → Reka → keyword)...")
             entities = await self._extract_entities(page_text)
             report.raw_entity_count = len(entities)
             logger.info("Extracted %d entities from %s", len(entities), url)
+            if self._bus:
+                names = [e.name for e in entities[:10]]
+                await self._bus.emit_step(
+                    "link_intel", "extract",
+                    f"Extracted {len(entities)} entities: {', '.join(names)}",
+                    {"entities": [e.name for e in entities]},
+                )
 
             # Step 3: research each entity
             researched: list[EntityResearch] = []
-            for entity in entities:
+            for i, entity in enumerate(entities):
                 try:
+                    if self._bus:
+                        await self._bus.emit_step(
+                            "link_intel", "research",
+                            f"Researching {entity.name} ({i+1}/{len(entities)})...",
+                        )
                     research = await self._research_entity(entity)
                     researched.append(research)
                 except Exception as exc:
                     logger.warning("Failed to research entity %s: %s", entity.name, exc)
+                    if self._bus:
+                        await self._bus.emit_error(
+                            "link_intel", "research", f"Research failed for {entity.name}: {exc}"
+                        )
 
             # Step 4: store in Neo4j (best-effort)
+            if self._bus:
+                await self._bus.emit_step("link_intel", "graph", f"Storing {len(researched)} tools in Neo4j...")
             try:
-                await self._store_in_graph(researched)
+                await self._store_in_graph(
+                    researched,
+                    source_url=url,
+                    source_type=self._infer_source_type(url),
+                    entity_count=len(entities),
+                )
+                if self._bus:
+                    await self._bus.emit_step("link_intel", "graph", f"Stored {len(researched)} tools in Neo4j")
             except Exception as exc:
                 logger.warning("Neo4j storage failed (non-fatal): %s", exc)
+                if self._bus:
+                    await self._bus.emit_error("link_intel", "graph", f"Neo4j storage failed: {exc}")
 
             # Step 5: check against existing harness tools
+            if self._bus:
+                await self._bus.emit_step("link_intel", "compare", "Comparing against existing harness tools...")
             comparisons: list[ToolComparison] = []
             for er in researched:
                 existing = await self._check_existing(er.entity)
@@ -190,9 +234,18 @@ class LinkIntelEngine:
                 researched, comparisons
             )
 
+            if self._bus:
+                await self._bus.emit_result(
+                    "link_intel", "complete",
+                    f"Found {len(report.discovered_tools)} tools, {len(report.recommended_actions)} actions",
+                    {"tool_count": len(report.discovered_tools)},
+                )
+
         except Exception as exc:
             logger.exception("Unexpected error analysing %s", url)
             report.error = str(exc)
+            if self._bus:
+                await self._bus.emit_error("link_intel", "error", f"Pipeline error: {exc}")
 
         return report
 
@@ -200,17 +253,21 @@ class LinkIntelEngine:
     # Pipeline steps
     # ------------------------------------------------------------------
 
-    async def _scrape_page(self, url: str) -> str:
+    async def _scrape_page(self, url: str) -> tuple[str, str]:
         """Retrieve page content via Tavily search, falling back to direct HTTP.
 
         Tavily's deep-extraction mode returns clean, structured text which is
-        superior to raw HTML for downstream LLM processing.
+        superior to raw HTML for downstream LLM processing.  When Tavily
+        results are available the page title is extracted from the first
+        result's ``title`` field.
 
         Args:
             url: The URL to scrape.
 
         Returns:
-            Plain-text content of the page, or an empty string on failure.
+            A ``(page_text, page_title)`` tuple.  *page_text* is the plain-text
+            content of the page (empty string on failure) and *page_title* is
+            the best-effort title (empty string if unknown).
         """
         logger.debug("Scraping %s via Tavily", url)
         try:
@@ -222,15 +279,19 @@ class LinkIntelEngine:
                     include_raw_content=True,
                 )
                 parts: list[str] = []
+                page_title = ""
                 if resp.answer:
                     parts.append(resp.answer)
-                for result in resp.results:
+                for idx, result in enumerate(resp.results):
+                    # Use the first result's title as the page title
+                    if idx == 0 and result.title:
+                        page_title = result.title
                     if result.raw_content:
                         parts.append(result.raw_content)
                     elif result.content:
                         parts.append(result.content)
                 if parts:
-                    return "\n\n".join(parts)
+                    return "\n\n".join(parts), page_title
         except Exception as exc:
             logger.warning("Tavily scrape failed for %s: %s — falling back to HTTP", url, exc)
 
@@ -239,17 +300,18 @@ class LinkIntelEngine:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 response = await client.get(url, headers={"User-Agent": "HackForge/0.1"})
                 response.raise_for_status()
-                return response.text
+                return response.text, ""
         except Exception as exc:
             logger.error("Direct HTTP fetch failed for %s: %s", url, exc)
-            return ""
+            return "", ""
 
     async def _extract_entities(self, text: str) -> list[Entity]:
-        """Extract tool/vendor/API entities from page text using Fastino.
+        """Extract tool/vendor/API entities from page text.
 
-        Sends the text to Fastino's fast-inference endpoint and parses the
-        structured JSON response.  Falls back to keyword-based extraction when
-        the API is unavailable.
+        Tries extraction providers in order of preference:
+          1. **Fastino** -- fast GLiNER2-based entity extraction.
+          2. **Reka** -- ``reka-flash`` model as an LLM fallback.
+          3. **Keyword** -- smart regex/dictionary scan as a last resort.
 
         Args:
             text: Raw page text (potentially large).
@@ -308,40 +370,222 @@ class LinkIntelEngine:
                 return unique
 
         except Exception as exc:
-            logger.warning("Fastino entity extraction failed: %s — using keyword fallback", exc)
+            logger.warning("Fastino entity extraction failed: %s — trying Reka", exc)
+            return await self._reka_entity_extraction(text)
+
+    async def _reka_entity_extraction(self, text: str) -> list[Entity]:
+        """Extract entities using Reka AI as an alternative to Fastino.
+
+        Uses the ``reka-flash`` model via the Reka chat completions API.
+        Falls back to :meth:`_keyword_entity_fallback` if Reka is also
+        unavailable.
+
+        Args:
+            text: Raw page text (potentially large).
+
+        Returns:
+            Deduplicated list of :class:`Entity` objects.
+        """
+        chunk = text[:12_000]
+
+        prompt = (
+            "You are an expert at identifying AI tools, APIs, SDKs, SaaS vendors, "
+            "and developer libraries mentioned in text.\n\n"
+            "Extract ALL tools/vendors/APIs from the following text. "
+            "Return ONLY a JSON array of objects, each with:\n"
+            '  "name": string (canonical product name),\n'
+            '  "entity_type": one of "tool"|"vendor"|"api"|"library",\n'
+            '  "raw_mention": exact phrase from text,\n'
+            '  "confidence": float 0-1\n\n'
+            f"TEXT:\n{chunk}\n\n"
+            "JSON:"
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=self._config.reka.timeout) as client:
+                response = await client.post(
+                    f"{self._config.reka.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self._config.reka.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "reka-flash",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 2048,
+                    },
+                )
+                response.raise_for_status()
+                data: dict[str, Any] = response.json()
+                # Reka uses "responses" array (not "choices"); each item
+                # has message.content directly.
+                raw_json: str = (
+                    data.get("responses", [{}])[0]
+                    .get("message", {})
+                    .get("content", "[]")
+                )
+                items: list[dict[str, Any]] = json.loads(raw_json)
+                entities = [Entity(**item) for item in items if "name" in item]
+                # Deduplicate by lowercase name
+                seen: set[str] = set()
+                unique: list[Entity] = []
+                for e in entities:
+                    key = e.name.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        unique.append(e)
+                logger.info("Reka entity extraction succeeded: %d entities", len(unique))
+                return unique
+
+        except Exception as exc:
+            logger.warning("Reka entity extraction failed: %s — using keyword fallback", exc)
             return self._keyword_entity_fallback(text)
 
-    def _keyword_entity_fallback(self, text: str) -> list[Entity]:
-        """Simple keyword scan used when Fastino is unavailable.
+    # Known AI/developer tool and vendor names for keyword fallback matching.
+    _KNOWN_TOOL_NAMES: list[str] = [
+        "Tavily", "Reka", "Fastino", "Neo4j", "Yutori", "Senso", "Modulate",
+        "Airbyte", "Render", "AWS", "OpenAI", "Numeric", "LangChain",
+        "Anthropic", "Hugging Face", "HuggingFace", "Pinecone", "Weaviate",
+        "Cohere", "Replicate", "Mistral", "Groq", "Together AI", "Perplexity",
+        "Vercel", "Supabase", "Firebase", "MongoDB", "Redis", "Postgres",
+        "Stripe", "Twilio", "SendGrid", "Algolia", "Elastic", "Datadog",
+        "Sentry", "LaunchDarkly", "Segment", "Amplitude", "Mixpanel",
+        "Cloudflare", "Fly.io", "Railway", "Neon", "PlanetScale", "Turso",
+        "Upstash", "Convex", "Clerk", "Auth0", "Okta", "WorkOS",
+        "LlamaIndex", "ChromaDB", "Chroma", "Qdrant", "Milvus", "Zilliz",
+        "Unstructured", "DocArray", "Haystack", "Marqo", "Vespa",
+        "Stability AI", "Midjourney", "ElevenLabs", "Deepgram", "AssemblyAI",
+        "Whisper", "DALL-E", "GPT-4", "Claude", "Gemini", "Llama",
+        "Streamlit", "Gradio", "Chainlit", "Modal", "Banana", "Baseten",
+        "Cerebrium", "RunPod", "Lambda", "Anyscale", "Weights & Biases",
+        "MLflow", "DVC", "ClearML", "Neptune", "Comet",
+    ]
 
-        Looks for common tool/API indicators like capitalized product names
-        followed by 'API', 'SDK', or 'platform'.
+    # URL-friendly slugs mapped to canonical names for URL-based detection.
+    _URL_TOOL_MAP: dict[str, str] = {
+        "tavily": "Tavily", "reka": "Reka", "fastino": "Fastino",
+        "neo4j": "Neo4j", "yutori": "Yutori", "senso": "Senso",
+        "modulate": "Modulate", "airbyte": "Airbyte", "render": "Render",
+        "openai": "OpenAI", "langchain": "LangChain", "anthropic": "Anthropic",
+        "huggingface": "Hugging Face", "pinecone": "Pinecone",
+        "weaviate": "Weaviate", "cohere": "Cohere", "replicate": "Replicate",
+        "mistral": "Mistral", "groq": "Groq", "together": "Together AI",
+        "perplexity": "Perplexity", "vercel": "Vercel", "supabase": "Supabase",
+        "firebase": "Firebase", "mongodb": "MongoDB", "redis": "Redis",
+        "stripe": "Stripe", "twilio": "Twilio", "sendgrid": "SendGrid",
+        "algolia": "Algolia", "elastic": "Elastic", "datadog": "Datadog",
+        "sentry": "Sentry", "segment": "Segment", "cloudflare": "Cloudflare",
+        "fly": "Fly.io", "railway": "Railway", "neon": "Neon",
+        "planetscale": "PlanetScale", "upstash": "Upstash", "convex": "Convex",
+        "clerk": "Clerk", "auth0": "Auth0", "workos": "WorkOS",
+        "llamaindex": "LlamaIndex", "chromadb": "ChromaDB", "qdrant": "Qdrant",
+        "milvus": "Milvus", "zilliz": "Zilliz", "stability": "Stability AI",
+        "elevenlabs": "ElevenLabs", "deepgram": "Deepgram",
+        "assemblyai": "AssemblyAI", "streamlit": "Streamlit",
+        "gradio": "Gradio", "chainlit": "Chainlit", "modal": "Modal",
+        "baseten": "Baseten", "runpod": "RunPod", "anyscale": "Anyscale",
+        "wandb": "Weights & Biases", "mlflow": "MLflow",
+        "numeric": "Numeric",
+    }
+
+    def _keyword_entity_fallback(self, text: str) -> list[Entity]:
+        """Smart keyword scan used when LLM-based extraction is unavailable.
+
+        Uses three complementary strategies:
+          1. **Known names** -- scans for a curated list of AI/developer tool
+             names appearing anywhere in the text.
+          2. **Contextual patterns** -- matches phrases like ``"powered by X"``,
+             ``"built with X"``, ``"X API"``, ``"X SDK"``, ``"X platform"``,
+             ``"sponsored by X"``, and ``"presented by X"``.
+          3. **URL matching** -- finds URLs containing known tool domain slugs
+             (e.g. ``reka.ai``, ``tavily.com``).
 
         Args:
             text: Raw page text.
 
         Returns:
-            Best-effort list of :class:`Entity` objects.
+            Best-effort list of :class:`Entity` objects (capped at 30).
         """
         import re
 
-        patterns = [
+        found: dict[str, Entity] = {}
+        text_lower = text.lower()
+
+        # --- Strategy 1: known tool/vendor names ---
+        for name in self._KNOWN_TOOL_NAMES:
+            # Use word-boundary matching; for multi-word names the boundary is
+            # at the start of the first word and end of the last word.
+            pattern = rf"\b{re.escape(name)}\b"
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                key = name.lower()
+                if key not in found:
+                    found[key] = Entity(
+                        name=name,
+                        entity_type="tool",
+                        raw_mention=match.group(0),
+                        confidence=0.7,
+                    )
+
+        # --- Strategy 2: contextual patterns ---
+        # Patterns where the tool name follows a keyword: "X API", "X SDK", etc.
+        suffix_patterns = [
             r"\b([A-Z][a-zA-Z0-9]{2,}(?:\s[A-Z][a-zA-Z0-9]+)?)\s+API\b",
             r"\b([A-Z][a-zA-Z0-9]{2,}(?:\s[A-Z][a-zA-Z0-9]+)?)\s+SDK\b",
             r"\b([A-Z][a-zA-Z0-9]{2,}(?:\s[A-Z][a-zA-Z0-9]+)?)\s+platform\b",
+            r"\b([A-Z][a-zA-Z0-9]{2,}(?:\s[A-Z][a-zA-Z0-9]+)?)\s+library\b",
+            r"\b([A-Z][a-zA-Z0-9]{2,}(?:\s[A-Z][a-zA-Z0-9]+)?)\s+framework\b",
+            r"\b([A-Z][a-zA-Z0-9]{2,}(?:\s[A-Z][a-zA-Z0-9]+)?)\s+integration\b",
         ]
-        found: dict[str, Entity] = {}
-        for pattern in patterns:
+        for pattern in suffix_patterns:
             for match in re.finditer(pattern, text):
                 name = match.group(1).strip()
-                if name.lower() not in found:
-                    found[name.lower()] = Entity(
+                key = name.lower()
+                if key not in found:
+                    found[key] = Entity(
                         name=name,
                         entity_type="tool",
                         raw_mention=match.group(0),
                         confidence=0.5,
                     )
-        return list(found.values())[:20]  # cap at 20 to avoid noise
+
+        # Patterns where the tool name follows a preposition:
+        # "powered by X", "built with X", "sponsored by X", "presented by X"
+        prefix_patterns = [
+            r"(?:powered\s+by|built\s+with|built\s+on|sponsored\s+by|presented\s+by|"
+            r"backed\s+by|maintained\s+by|developed\s+by|created\s+with|hosted\s+on|"
+            r"deployed\s+on|runs\s+on|using)\s+"
+            r"([A-Z][a-zA-Z0-9]+(?:\s[A-Z][a-zA-Z0-9]+)?(?:\.\w+)?)",
+        ]
+        for pattern in prefix_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                name = match.group(1).strip()
+                key = name.lower()
+                if key not in found:
+                    found[key] = Entity(
+                        name=name,
+                        entity_type="vendor",
+                        raw_mention=match.group(0),
+                        confidence=0.6,
+                    )
+
+        # --- Strategy 3: URL-based detection ---
+        url_pattern = r"https?://(?:www\.)?([a-zA-Z0-9-]+)\.[a-zA-Z]{2,}"
+        for match in re.finditer(url_pattern, text):
+            domain_slug = match.group(1).lower()
+            if domain_slug in self._URL_TOOL_MAP:
+                canonical = self._URL_TOOL_MAP[domain_slug]
+                key = canonical.lower()
+                if key not in found:
+                    found[key] = Entity(
+                        name=canonical,
+                        entity_type="tool",
+                        raw_mention=match.group(0),
+                        confidence=0.6,
+                    )
+
+        return list(found.values())[:30]  # cap at 30 to avoid noise
 
     async def _research_entity(self, entity: Entity) -> EntityResearch:
         """Deep-research a single entity using Tavily.
@@ -492,14 +736,46 @@ class LinkIntelEngine:
 
         return None
 
-    async def _store_in_graph(self, entities: list[EntityResearch]) -> None:
+    @staticmethod
+    def _infer_source_type(url: str) -> str:
+        """Infer the source type from a URL.
+
+        Args:
+            url: The URL to classify.
+
+        Returns:
+            One of ``"luma"``, ``"youtube"``, ``"instagram"``, or ``"manual"``.
+        """
+        url_lower = url.lower()
+        if "lu.ma" in url_lower or "luma" in url_lower:
+            return "luma"
+        if "youtube.com" in url_lower or "youtu.be" in url_lower:
+            return "youtube"
+        if "instagram.com" in url_lower:
+            return "instagram"
+        return "manual"
+
+    async def _store_in_graph(
+        self,
+        entities: list[EntityResearch],
+        *,
+        source_url: str = "",
+        source_type: str = "manual",
+        entity_count: int = 0,
+    ) -> None:
         """Store discovered entities and their relationships in Neo4j.
 
-        Creates ``Tool`` nodes and ``DISCOVERED_FROM`` relationships.
+        Creates ``Tool`` nodes, a ``DiscoveryEvent`` node for this run, and
+        ``DISCOVERED_FROM`` relationships linking each tool to the event.
         Skips gracefully when Neo4j is not configured.
 
         Args:
             entities: List of researched entities to persist.
+            source_url: The URL that was analysed in this discovery run.
+            source_type: One of ``"luma"``, ``"youtube"``, ``"instagram"``,
+                         ``"manual"``.
+            entity_count: Total number of raw entities extracted before
+                          filtering/dedup.
         """
         if not self._config.neo4j_password and not self._config.neo4j_uri:
             logger.debug("Neo4j not configured — skipping graph storage.")
@@ -517,6 +793,7 @@ class LinkIntelEngine:
         )
         try:
             async with driver.session() as session:
+                # --- Upsert Tool nodes ---
                 for er in entities:
                     t = er.tool
                     await session.run(
@@ -537,6 +814,25 @@ class LinkIntelEngine:
                         has_free_tier=t.has_free_tier,
                     )
                     logger.debug("Stored %s in Neo4j", t.name)
+
+                # --- Create DiscoveryEvent and link to tools ---
+                tool_names = [er.tool.name for er in entities]
+                if tool_names and source_url:
+                    from hackforge.graph.queries import LOG_DISCOVERY
+
+                    await session.run(
+                        LOG_DISCOVERY,
+                        url=source_url,
+                        source_type=source_type,
+                        engine_used="link_intel",
+                        entity_count=entity_count,
+                        tool_names=tool_names,
+                    )
+                    logger.info(
+                        "Created DiscoveryEvent for %s with %d tools",
+                        source_url,
+                        len(tool_names),
+                    )
         finally:
             await driver.close()
 

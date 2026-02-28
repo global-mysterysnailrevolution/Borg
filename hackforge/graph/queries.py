@@ -8,6 +8,7 @@ Query naming convention
 -----------------------
 UPSERT_*       — MERGE-based create-or-update for nodes
 CREATE_*_REL   — MERGE-based create-or-update for relationships
+LOG_*          — Create event/audit nodes for traceability
 FIND_*         — Read queries that return matched subgraphs
 GET_*          — Read queries that fetch full node/subgraph data
 SEARCH_*       — Read queries that perform free-text or property search
@@ -170,6 +171,86 @@ RETURN r
 """Record the URL from which a tool was discovered.
 
 Required params: tool_name, source_url.
+"""
+
+# ===========================================================================
+# DISCOVERY / INTEGRATION / AUDIT QUERIES
+# ===========================================================================
+
+LOG_DISCOVERY = """
+CREATE (d:DiscoveryEvent {
+    url:          $url,
+    timestamp:    datetime(),
+    source_type:  $source_type,
+    engine_used:  $engine_used,
+    entity_count: $entity_count
+})
+WITH d
+UNWIND $tool_names AS tool_name
+MATCH (t:Tool {name: tool_name})
+MERGE (t)-[:DISCOVERED_FROM]->(d)
+RETURN d, collect(t.name) AS linked_tools
+"""
+"""Create a DiscoveryEvent node and link it to all tools found in this run.
+
+Required params: url, source_type, engine_used, entity_count, tool_names (list[str]).
+Returns: the DiscoveryEvent node and the list of linked tool names.
+"""
+
+LOG_INTEGRATION = """
+MATCH (t:Tool {name: $tool_name})
+CREATE (i:IntegrationEvent {
+    timestamp:        datetime(),
+    method:           $method,
+    status:           $status,
+    api_key_obtained: $api_key_obtained
+})
+MERGE (t)-[:INTEGRATED_VIA]->(i)
+RETURN t, i
+"""
+"""Create an IntegrationEvent for a specific tool.
+
+Required params: tool_name, method, status, api_key_obtained.
+Returns: the Tool and IntegrationEvent nodes.
+"""
+
+CREATE_AUDIT_LOG = """
+CREATE (a:AuditLog {
+    timestamp: datetime(),
+    action:    $action,
+    actor:     $actor,
+    details:   $details
+})
+WITH a
+OPTIONAL MATCH (d:DiscoveryEvent)
+  WHERE id(d) = $event_id AND $event_label = 'DiscoveryEvent'
+OPTIONAL MATCH (i:IntegrationEvent)
+  WHERE id(i) = $event_id AND $event_label = 'IntegrationEvent'
+WITH a, coalesce(d, i) AS source_event
+WHERE source_event IS NOT NULL
+MERGE (source_event)-[:LOGGED]->(a)
+RETURN a, source_event
+"""
+"""Create an AuditLog entry, optionally linked to a DiscoveryEvent or IntegrationEvent.
+
+Required params: action, actor, details, event_id (int, Neo4j internal id or -1),
+                 event_label ('DiscoveryEvent' | 'IntegrationEvent' | '').
+Returns: the AuditLog node and its linked source event (if any).
+"""
+
+CREATE_AUDIT_LOG_SIMPLE = """
+CREATE (a:AuditLog {
+    timestamp: datetime(),
+    action:    $action,
+    actor:     $actor,
+    details:   $details
+})
+RETURN a
+"""
+"""Create a standalone AuditLog entry with no linked event.
+
+Required params: action, actor, details.
+Returns: the AuditLog node.
 """
 
 # ===========================================================================
@@ -402,6 +483,89 @@ No required params.
 Returns: total, integrated, unintegrated, coverage_pct.
 """
 
+GET_TOOL_HISTORY = """
+MATCH (t:Tool {name: $tool_name})
+OPTIONAL MATCH (t)-[:DISCOVERED_FROM]->(d:DiscoveryEvent)
+OPTIONAL MATCH (t)-[:INTEGRATED_VIA]->(i:IntegrationEvent)
+OPTIONAL MATCH (d)-[:LOGGED]->(da:AuditLog)
+OPTIONAL MATCH (i)-[:LOGGED]->(ia:AuditLog)
+RETURN t.name                                      AS tool,
+       collect(DISTINCT {
+           type: 'discovery',
+           url: d.url,
+           timestamp: d.timestamp,
+           source_type: d.source_type,
+           engine_used: d.engine_used,
+           entity_count: d.entity_count
+       })                                           AS discoveries,
+       collect(DISTINCT {
+           type: 'integration',
+           timestamp: i.timestamp,
+           method: i.method,
+           status: i.status,
+           api_key_obtained: i.api_key_obtained
+       })                                           AS integrations,
+       collect(DISTINCT {
+           timestamp: da.timestamp,
+           action: da.action,
+           actor: da.actor,
+           details: da.details
+       }) + collect(DISTINCT {
+           timestamp: ia.timestamp,
+           action: ia.action,
+           actor: ia.actor,
+           details: ia.details
+       })                                           AS audit_entries
+ORDER BY t.name
+"""
+"""Get the full discovery + integration timeline for a tool.
+
+Required params: tool_name.
+Returns: tool name, list of discovery events, integration events, and audit entries.
+"""
+
+GET_RECENT_DISCOVERIES = """
+MATCH (d:DiscoveryEvent)
+OPTIONAL MATCH (t:Tool)-[:DISCOVERED_FROM]->(d)
+WITH d, collect(t.name) AS tools
+ORDER BY d.timestamp DESC
+LIMIT $limit
+RETURN d.url          AS url,
+       d.timestamp    AS timestamp,
+       d.source_type  AS source_type,
+       d.engine_used  AS engine_used,
+       d.entity_count AS entity_count,
+       tools
+"""
+"""Get the last N discovery events with their linked tools.
+
+Required params: limit (int).
+Returns: url, timestamp, source_type, engine_used, entity_count, tools (list of names).
+"""
+
+GET_AUDIT_TRAIL = """
+MATCH (a:AuditLog)
+WHERE a.timestamp >= datetime($start_time)
+  AND a.timestamp <= datetime($end_time)
+OPTIONAL MATCH (source)-[:LOGGED]->(a)
+RETURN a.timestamp AS timestamp,
+       a.action    AS action,
+       a.actor     AS actor,
+       a.details   AS details,
+       labels(source)[0] AS source_type,
+       CASE
+           WHEN source:DiscoveryEvent THEN source.url
+           WHEN source:IntegrationEvent THEN source.method
+           ELSE null
+       END AS source_ref
+ORDER BY a.timestamp DESC
+"""
+"""Get the full audit trail for a time period.
+
+Required params: start_time (ISO-8601 string), end_time (ISO-8601 string).
+Returns: timestamp, action, actor, details, source_type, source_ref.
+"""
+
 FIND_TOOLS_WITHOUT_CAPABILITY = """
 MATCH (t:Tool)
 WHERE NOT (t)-[:PROVIDES]->(:Capability)
@@ -443,6 +607,10 @@ QUERY_REGISTRY: dict[str, str] = {
     "CREATE_HAS_ENDPOINT_REL": CREATE_HAS_ENDPOINT_REL,
     "CREATE_REQUIRES_REL": CREATE_REQUIRES_REL,
     "CREATE_DISCOVERED_FROM_REL": CREATE_DISCOVERED_FROM_REL,
+    "LOG_DISCOVERY": LOG_DISCOVERY,
+    "LOG_INTEGRATION": LOG_INTEGRATION,
+    "CREATE_AUDIT_LOG": CREATE_AUDIT_LOG,
+    "CREATE_AUDIT_LOG_SIMPLE": CREATE_AUDIT_LOG_SIMPLE,
     "FIND_SIMILAR_TOOLS": FIND_SIMILAR_TOOLS,
     "FIND_ALTERNATIVES": FIND_ALTERNATIVES,
     "GET_TOOL_SUBGRAPH": GET_TOOL_SUBGRAPH,
@@ -455,6 +623,9 @@ QUERY_REGISTRY: dict[str, str] = {
     "FULL_TOOL_REPORT": FULL_TOOL_REPORT,
     "GET_CAPABILITY_GRAPH": GET_CAPABILITY_GRAPH,
     "GET_INTEGRATION_COVERAGE": GET_INTEGRATION_COVERAGE,
+    "GET_TOOL_HISTORY": GET_TOOL_HISTORY,
+    "GET_RECENT_DISCOVERIES": GET_RECENT_DISCOVERIES,
+    "GET_AUDIT_TRAIL": GET_AUDIT_TRAIL,
     "FIND_TOOLS_WITHOUT_CAPABILITY": FIND_TOOLS_WITHOUT_CAPABILITY,
     "DELETE_TOOL": DELETE_TOOL,
 }
