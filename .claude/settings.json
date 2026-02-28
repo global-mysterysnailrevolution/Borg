@@ -57,7 +57,8 @@
     "TAVILY_MCP_URL": "https://mcp.tavily.com/mcp/?tavilyApiKey=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",
     "REKA_API_KEY": "f1a9fc5003ed55af3a7f5f03ed5abafec5b2414afb8331a95e232326e2abbb3e",
     "MODULATE_API_KEY": "3f5e11e3-a96d-4f70-9608-3c138c49842f",
-    "YUTORI_API_KEY": "yt_EnoFaMaV8JxwR19oq2zvb2A9LegEoYodNgr10g-NQJM"
+    "YUTORI_API_KEY": "yt_EnoFaMaV8JxwR19oq2zvb2A9LegEoYodNgr10g-NQJM",
+    "FASTINO_API_KEY": "USsRhsHVZGBPnQw8CBvJyEQN:8a14c2f9-d94b-4c72-8f5c-a62908e5b30e"
   },
   "mcpServers": {
     "tavily": {

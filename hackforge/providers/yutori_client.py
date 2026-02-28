@@ -405,3 +405,105 @@ class YutoriClient:
             status=result.get("status", "stopped"),
             raw=result,
         )
+
+    # ------------------------------------------------------------------
+    # Yutori REST Browsing API (https://api.yutori.com/v1)
+    # ------------------------------------------------------------------
+
+    _BROWSING_API = "https://api.yutori.com/v1"
+
+    async def create_browsing_task(
+        self,
+        start_url: str,
+        task: str,
+        *,
+        require_auth: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        max_steps: int = 30,
+        agent: str = "navigator-n1-latest",
+    ) -> dict[str, Any]:
+        """Create a Yutori browsing task via the REST API.
+
+        Args:
+            start_url: URL to open before running the task.
+            task: Natural-language description of the browsing task.
+            require_auth: Hint that the task involves authentication;
+                uses an auth-optimized browser provider.
+            output_schema: JSON Schema for structured output extraction.
+            max_steps: Maximum navigation steps (2-100).
+            agent: Agent model to use.
+
+        Returns:
+            Dict with ``task_id``, ``view_url``, ``status``.
+        """
+        payload: dict[str, Any] = {
+            "start_url": start_url,
+            "task": task,
+            "max_steps": max_steps,
+            "agent": agent,
+        }
+        if require_auth:
+            payload["require_auth"] = True
+        if output_schema:
+            payload["output_schema"] = output_schema
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self._BROWSING_API}/browsing/tasks",
+                headers={
+                    "X-API-Key": self._config.api_key,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_task_status(self, task_id: str) -> dict[str, Any]:
+        """Poll a Yutori browsing task for its current status.
+
+        Args:
+            task_id: The task ID returned by :meth:`create_browsing_task`.
+
+        Returns:
+            Dict with ``task_id``, ``status``, ``result``, ``structured_result``.
+        """
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{self._BROWSING_API}/browsing/tasks/{task_id}",
+                headers={"X-API-Key": self._config.api_key},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def wait_for_task(
+        self,
+        task_id: str,
+        timeout: float = 120,
+        poll_interval: float = 3,
+    ) -> dict[str, Any]:
+        """Poll a browsing task until it succeeds or fails.
+
+        Args:
+            task_id: The task ID to poll.
+            timeout: Maximum seconds to wait.
+            poll_interval: Seconds between polls.
+
+        Returns:
+            Final task response dict.
+        """
+        elapsed = 0.0
+        while elapsed < timeout:
+            data = await self.get_task_status(task_id)
+            status = data.get("status", "")
+            if status in ("succeeded", "failed"):
+                return data
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        return {
+            "task_id": task_id,
+            "status": "timeout",
+            "result": None,
+            "error": f"Task timed out after {timeout}s",
+        }

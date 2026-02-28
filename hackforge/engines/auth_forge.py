@@ -1,16 +1,21 @@
-"""Auth Forge Engine — Agentic Authentication and API Key Acquisition.
+"""Auth Forge Engine — Yutori-Powered OAuth + API Key Acquisition.
 
 Automatically navigates vendor signup/developer-portal pages to acquire API
-keys, storing the credentials in ``.claude/settings.json`` for immediate use
-by the harness.
+keys using Yutori's cloud browser agent. Supports Google OAuth, GitHub SSO,
+and email/password signup flows.
 
 Pipeline per tool:
-  find signup page (Tavily) → navigate & fill forms (Yutori browse)
+  find signup page (Tavily) → Yutori navigates signup (OAuth or email)
   → extract API key from dashboard → store in settings.json → return AuthResult
+
+Uses the real Yutori Browsing API:
+  POST https://api.yutori.com/v1/browsing/tasks  (create task)
+  GET  https://api.yutori.com/v1/browsing/tasks/{id}  (poll status)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -21,23 +26,16 @@ import httpx
 from pydantic import BaseModel, Field
 
 from hackforge.config import HackForgeConfig
+from hackforge.pipeline_bus import PipelineBus
 
 logger = logging.getLogger(__name__)
+
+YUTORI_API = "https://api.yutori.com/v1"
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
-
-
-class BrowseResult(BaseModel):
-    """Result returned by a Yutori browse action."""
-
-    url: str
-    page_text: str = ""
-    extracted_data: dict[str, Any] = Field(default_factory=dict)
-    success: bool = True
-    error: str | None = None
 
 
 class AuthResult(BaseModel):
@@ -51,6 +49,7 @@ class AuthResult(BaseModel):
     manual_steps: list[str] = Field(default_factory=list)
     dashboard_url: str = ""
     docs_url: str = ""
+    view_url: str = ""  # Yutori live browser view URL
     error: str | None = None
 
 
@@ -60,13 +59,13 @@ class AuthResult(BaseModel):
 
 
 class AuthForgeEngine:
-    """Agentically navigates vendor signup pages to acquire API keys.
+    """Navigates vendor signup pages via Yutori cloud browser to acquire API keys.
 
     Uses:
     - **Tavily** to search for developer/API signup and documentation pages.
-    - **Yutori browse** to navigate sign-up flows and fill in form fields
-      (email, password, account details) automatically.
-    - Local file I/O to persist keys into ``.claude/settings.json``.
+    - **Yutori Browsing API** to navigate sign-up flows, handle OAuth, and
+      extract API keys from dashboards.
+    - Local file I/O to persist keys into ``.claude/settings.json`` and ``.env``.
 
     Usage::
 
@@ -80,15 +79,101 @@ class AuthForgeEngine:
                 print(f"Manual step needed: {step}")
     """
 
-    def __init__(self, config: HackForgeConfig) -> None:
+    def __init__(
+        self,
+        config: HackForgeConfig,
+        bus: PipelineBus | None = None,
+    ) -> None:
         self._config = config
+        self._bus = bus
+
+    # ------------------------------------------------------------------
+    # Pipeline bus helper
+    # ------------------------------------------------------------------
+
+    async def _emit(self, step: str, message: str, data: dict[str, Any] | None = None) -> None:
+        if self._bus:
+            await self._bus.emit_step("auth_forge", step, message, data or {})
+
+    async def _emit_error(self, step: str, message: str) -> None:
+        if self._bus:
+            await self._bus.emit_error("auth_forge", step, message)
+
+    # ------------------------------------------------------------------
+    # Yutori Browsing API helpers
+    # ------------------------------------------------------------------
+
+    async def _create_task(
+        self,
+        start_url: str,
+        task: str,
+        *,
+        require_auth: bool = False,
+        output_schema: dict[str, Any] | None = None,
+        max_steps: int = 30,
+    ) -> dict[str, Any]:
+        """Create a Yutori browsing task.
+
+        Returns dict with task_id, view_url, status.
+        """
+        payload: dict[str, Any] = {
+            "start_url": start_url,
+            "task": task,
+            "max_steps": max_steps,
+            "agent": "navigator-n1-latest",
+        }
+        if require_auth:
+            payload["require_auth"] = True
+        if output_schema:
+            payload["output_schema"] = output_schema
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{YUTORI_API}/browsing/tasks",
+                headers={
+                    "X-API-Key": self._config.yutori.api_key,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _poll_task(
+        self,
+        task_id: str,
+        timeout: float = 120,
+        poll_interval: float = 3,
+    ) -> dict[str, Any]:
+        """Poll a Yutori browsing task until it succeeds or fails.
+
+        Returns the final task response dict.
+        """
+        elapsed = 0.0
+        while elapsed < timeout:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{YUTORI_API}/browsing/tasks/{task_id}",
+                    headers={"X-API-Key": self._config.yutori.api_key},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            status = data.get("status", "")
+            if status in ("succeeded", "failed"):
+                return data
+
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        return {"status": "timeout", "result": None, "error": f"Task timed out after {timeout}s"}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     async def setup_tool(self, tool_name: str, vendor_url: str) -> AuthResult:
-        """Full auth flow: find signup → navigate → get API key → configure.
+        """Full auth flow: find signup → navigate → get API key → store.
 
         Args:
             tool_name: Human-readable name of the tool (e.g. ``"Tavily"``).
@@ -101,60 +186,102 @@ class AuthForgeEngine:
         logger.info("AuthForge: setting up %s (%s)", tool_name, vendor_url)
         result = AuthResult(tool_name=tool_name)
 
+        if not self._config.yutori.api_key:
+            result.error = "Yutori API key not configured"
+            result.manual_steps.append(
+                f"Yutori API key required. Navigate to {vendor_url} and sign up manually."
+            )
+            await self._emit_error("start", "Yutori API key not configured")
+            return result
+
         try:
             # Step 1: find the developer/API signup page
-            signup_url = await self._find_signup_page(vendor_url)
+            await self._emit("search", f"Searching for {tool_name} developer signup page...")
+            signup_url = await self._find_signup_page(tool_name, vendor_url)
             if not signup_url:
-                result.manual_steps.append(
-                    f"Could not find signup page for {tool_name}. "
-                    f"Navigate manually to {vendor_url} and sign up."
-                )
-                result.error = "Signup page not found via Tavily search."
-                return result
+                signup_url = vendor_url  # fallback to vendor homepage
+                await self._emit("search", f"No specific signup page found, using {vendor_url}")
 
-            logger.info("AuthForge: found signup page %s", signup_url)
+            await self._emit("search", f"Found signup page: {signup_url}")
 
-            # Step 2: navigate the signup form via Yutori
+            # Step 2: navigate the signup form via Yutori (with OAuth support)
+            await self._emit("navigate", f"Yutori navigating to {signup_url}...")
             user_email = self._get_user_email()
-            browse_result = await self._navigate_signup(signup_url, user_email)
+            nav_result = await self._navigate_signup(signup_url, user_email, tool_name)
 
-            if not browse_result.success:
-                result.manual_steps.append(
-                    f"Automated signup failed. Please navigate to {signup_url} "
-                    f"and complete registration manually using: {user_email}"
-                )
-                result.error = browse_result.error
+            result.view_url = nav_result.get("view_url", "")
+            if result.view_url:
+                await self._emit("navigate", f"Watch live: {result.view_url}", {"view_url": result.view_url})
 
-            # Step 3: attempt to extract the API key from the resulting page
-            dashboard_url = browse_result.extracted_data.get("dashboard_url", "")
-            result.dashboard_url = dashboard_url
+            # Poll for navigation completion
+            task_id = nav_result.get("task_id", "")
+            if task_id:
+                await self._emit("navigate", "Waiting for Yutori to complete signup flow...")
+                nav_data = await self._poll_task(task_id, timeout=self._config.yutori.timeout)
+                nav_status = nav_data.get("status", "")
 
-            api_key = await self._extract_api_key(
-                dashboard_url or browse_result.url
-            )
+                if nav_status == "failed":
+                    await self._emit_error("navigate", f"Signup navigation failed: {nav_data.get('result', 'unknown error')}")
+                    result.manual_steps.append(
+                        f"Automated signup failed. Navigate to {signup_url} and sign up manually."
+                    )
+                elif nav_status == "succeeded":
+                    await self._emit("navigate", "Signup navigation completed successfully")
+                    # Check if the nav result already contains an API key
+                    structured = nav_data.get("structured_result") or {}
+                    if isinstance(structured, dict) and structured.get("api_key"):
+                        result.api_key = structured["api_key"]
+                        result.dashboard_url = structured.get("dashboard_url", "")
+                        await self._emit("extract", f"API key found during signup: {result.api_key[:8]}...")
+                else:
+                    await self._emit_error("navigate", f"Signup navigation timed out")
+                    result.manual_steps.append("Navigation timed out. Try again or sign up manually.")
 
-            if not api_key:
-                result.manual_steps.append(
-                    "Could not auto-extract API key. "
-                    f"Please log into {vendor_url}, navigate to your dashboard or "
-                    "API settings, copy your API key, and run:\n"
-                    f"  hackforge auth store {tool_name} <YOUR_API_KEY>"
-                )
-            else:
-                # Step 4: persist the key
-                config_path = await self._store_credentials(tool_name, api_key)
-                result.api_key = api_key
+            # Step 3: If we don't have a key yet, try extracting from dashboard
+            if not result.api_key:
+                dashboard_url = result.dashboard_url or signup_url
+                await self._emit("extract", f"Extracting API key from {dashboard_url}...")
+                api_key, extract_view_url = await self._extract_api_key(tool_name, dashboard_url)
+
+                if extract_view_url:
+                    result.view_url = extract_view_url
+
+                if api_key:
+                    result.api_key = api_key
+                    await self._emit("extract", f"API key extracted: {api_key[:8]}...")
+                else:
+                    await self._emit_error("extract", "Could not auto-extract API key")
+                    result.manual_steps.append(
+                        f"Could not auto-extract API key. Log into {vendor_url}, "
+                        "go to API settings, copy your key, and paste it in the .env file."
+                    )
+
+            # Step 4: Store the key if we got one
+            if result.api_key:
+                await self._emit("store", f"Storing API key for {tool_name}...")
+                config_path = await self._store_credentials(tool_name, result.api_key)
                 result.config_path = str(config_path)
                 result.setup_complete = True
+                result.auth_type = "api_key"
+                await self._emit("complete", f"{tool_name} API key acquired and stored!")
                 logger.info("AuthForge: stored API key for %s", tool_name)
+            else:
+                await self._emit_error("complete", f"Could not acquire API key for {tool_name}")
+
+        except httpx.HTTPStatusError as exc:
+            error_msg = f"Yutori API error: {exc.response.status_code}"
+            logger.exception("AuthForge: HTTP error setting up %s", tool_name)
+            result.error = error_msg
+            result.manual_steps.append(f"{error_msg}. Sign up manually at {vendor_url}.")
+            await self._emit_error("error", error_msg)
 
         except Exception as exc:
             logger.exception("AuthForge: unexpected error setting up %s", tool_name)
             result.error = str(exc)
             result.manual_steps.append(
-                f"Unexpected error during auth flow: {exc}. "
-                "Please complete setup manually."
+                f"Unexpected error: {exc}. Complete setup manually at {vendor_url}."
             )
+            await self._emit_error("error", str(exc))
 
         return result
 
@@ -162,238 +289,202 @@ class AuthForgeEngine:
     # Step 1: find signup page
     # ------------------------------------------------------------------
 
-    async def _find_signup_page(self, vendor_url: str) -> str:
-        """Use Tavily to locate the developer/API signup or dashboard URL.
-
-        Runs several targeted queries to find the exact page where a developer
-        can sign up for API access.
-
-        Args:
-            vendor_url: The vendor's primary website URL.
-
-        Returns:
-            URL of the signup/developer-portal page, or empty string if none found.
-        """
-        from hackforge.providers.tavily_client import TavilyClient
+    async def _find_signup_page(self, tool_name: str, vendor_url: str) -> str:
+        """Use Tavily to locate the developer/API signup or dashboard URL."""
+        if not self._config.tavily.api_key:
+            return ""
 
         queries = [
-            f"site:{vendor_url} developer API signup register",
-            f"{vendor_url} API key developer portal signup",
-            f"{vendor_url} get API key quickstart",
+            f"{tool_name} developer API signup get API key",
+            f"site:{vendor_url} developer API key dashboard",
+            f"{tool_name} API documentation quickstart",
         ]
 
-        async with TavilyClient(self._config.tavily) as client:
-            for query in queries:
-                try:
-                    resp = await client.search(query, max_results=5, search_depth="basic")
-                    for result in resp.results:
-                        url_lower = result.url.lower()
-                        # Prefer URLs that look like signup/developer pages
-                        if any(
-                            kw in url_lower
-                            for kw in (
-                                "signup", "sign-up", "register", "developer",
-                                "api-keys", "apikeys", "console", "dashboard",
-                                "get-started", "quickstart",
-                            )
-                        ):
-                            return result.url
-                    # Fallback: return the first result URL if any
-                    if resp.results:
-                        return resp.results[0].url
-                except Exception as exc:
-                    logger.debug("Tavily query failed: %q — %s", query, exc)
+        try:
+            async with httpx.AsyncClient(timeout=self._config.tavily.timeout) as client:
+                for query in queries:
+                    try:
+                        resp = await client.post(
+                            f"{self._config.tavily.base_url}/search",
+                            json={
+                                "api_key": self._config.tavily.api_key,
+                                "query": query,
+                                "max_results": 5,
+                                "search_depth": "basic",
+                            },
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+
+                        for r in data.get("results", []):
+                            url_lower = r.get("url", "").lower()
+                            if any(
+                                kw in url_lower
+                                for kw in (
+                                    "signup", "sign-up", "register", "developer",
+                                    "api-keys", "apikeys", "console", "dashboard",
+                                    "get-started", "quickstart", "docs", "api",
+                                )
+                            ):
+                                return r["url"]
+
+                        # Fallback: first result
+                        results = data.get("results", [])
+                        if results:
+                            return results[0]["url"]
+                    except Exception as exc:
+                        logger.debug("Tavily query failed: %s — %s", query, exc)
+        except Exception as exc:
+            logger.debug("Tavily search failed: %s", exc)
 
         return ""
 
     # ------------------------------------------------------------------
-    # Step 2: navigate signup
+    # Step 2: navigate signup via Yutori
     # ------------------------------------------------------------------
 
     async def _navigate_signup(
-        self, signup_url: str, user_email: str
-    ) -> BrowseResult:
-        """Use Yutori browse to navigate the signup page and fill in forms.
+        self,
+        signup_url: str,
+        user_email: str,
+        tool_name: str,
+    ) -> dict[str, Any]:
+        """Use Yutori Browsing API to navigate the signup page.
 
-        Sends an agentic browsing request to Yutori with the signup URL and
-        the user's email.  Yutori will attempt to:
-          - Fill the email field.
-          - Generate and fill a password (returned in ``extracted_data``).
-          - Submit the form.
-          - Return the resulting dashboard URL if registration succeeds.
+        Uses require_auth=True for OAuth-optimized browsing.
 
-        Args:
-            signup_url: URL of the signup page to navigate.
-            user_email: Email address to register with.
-
-        Returns:
-            A :class:`BrowseResult` with success status and any extracted data.
+        Returns the task creation response with task_id and view_url.
         """
-        if not self._config.yutori.api_key:
-            logger.warning("Yutori not configured — cannot auto-navigate signup")
-            return BrowseResult(
-                url=signup_url,
-                success=False,
-                error="Yutori API key not configured.",
-            )
+        task_description = (
+            f"Navigate to this {tool_name} page and sign up for developer/API access. "
+            f"Look for these options in order of preference:\n"
+            f"1. 'Sign in with Google' or 'Continue with Google' button\n"
+            f"2. 'Sign in with GitHub' or 'Continue with GitHub' button\n"
+            f"3. Email/password registration form\n\n"
+            f"If using email signup, use: {user_email}\n\n"
+            f"After signing in or registering, navigate to the API keys page, "
+            f"developer dashboard, or settings where API keys are managed. "
+            f"If you see an API key or access token, note it."
+        )
 
-        try:
-            async with httpx.AsyncClient(timeout=self._config.yutori.timeout) as client:
-                response = await client.post(
-                    f"{self._config.yutori.base_url}/browse/agent",
-                    headers={
-                        "Authorization": f"Bearer {self._config.yutori.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "url": signup_url,
-                        "goal": (
-                            "Complete the developer signup/registration form. "
-                            "Use the provided email address. Generate a strong password. "
-                            "After registering, navigate to the API keys or developer dashboard "
-                            "and return the dashboard URL and any visible API keys."
-                        ),
-                        "form_data": {
-                            "email": user_email,
-                        },
-                        "extract": ["dashboard_url", "api_key", "api_token"],
-                        "max_steps": 15,
-                    },
-                )
-                response.raise_for_status()
-                data: dict[str, Any] = response.json()
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "api_key": {
+                    "type": "string",
+                    "description": "API key or access token if visible",
+                },
+                "dashboard_url": {
+                    "type": "string",
+                    "description": "URL of the API dashboard or keys page",
+                },
+                "auth_method": {
+                    "type": "string",
+                    "description": "How authentication was completed: google_oauth, github_oauth, email_signup, or failed",
+                },
+            },
+        }
 
-                return BrowseResult(
-                    url=data.get("final_url", signup_url),
-                    page_text=data.get("page_text", ""),
-                    extracted_data=data.get("extracted", {}),
-                    success=data.get("success", False),
-                    error=data.get("error"),
-                )
-
-        except httpx.HTTPStatusError as exc:
-            logger.warning("Yutori browse HTTP error: %s", exc)
-            return BrowseResult(
-                url=signup_url,
-                success=False,
-                error=f"Yutori HTTP error: {exc.response.status_code}",
-            )
-        except Exception as exc:
-            logger.warning("Yutori browse failed: %s", exc)
-            return BrowseResult(
-                url=signup_url,
-                success=False,
-                error=str(exc),
-            )
+        return await self._create_task(
+            start_url=signup_url,
+            task=task_description,
+            require_auth=True,
+            output_schema=output_schema,
+            max_steps=50,
+        )
 
     # ------------------------------------------------------------------
     # Step 3: extract API key
     # ------------------------------------------------------------------
 
-    async def _extract_api_key(self, dashboard_url: str) -> str | None:
-        """Attempt to extract an API key from a dashboard page.
+    async def _extract_api_key(
+        self, tool_name: str, dashboard_url: str
+    ) -> tuple[str | None, str]:
+        """Attempt to extract an API key from a dashboard page via Yutori.
 
-        Uses two strategies:
-          1. Yutori agent browse with explicit goal to find and copy the API key.
-          2. Regex scan of raw page HTML for common API key patterns.
-
-        Args:
-            dashboard_url: URL of the dashboard or API-keys page.
-
-        Returns:
-            The API key string if found, else ``None``.
+        Returns (api_key_or_None, view_url).
         """
         if not dashboard_url:
-            return None
+            return None, ""
 
-        # Strategy 1: Yutori agent extraction
-        if self._config.yutori.api_key:
-            key = await self._extract_key_via_yutori(dashboard_url)
-            if key:
-                return key
-
-        # Strategy 2: direct HTTP + regex
-        return await self._extract_key_via_regex(dashboard_url)
-
-    async def _extract_key_via_yutori(self, dashboard_url: str) -> str | None:
-        """Ask Yutori to navigate to the dashboard and extract the API key.
-
-        Args:
-            dashboard_url: URL of the API dashboard page.
-
-        Returns:
-            API key string or ``None``.
-        """
+        # Strategy 1: Yutori with structured extraction
         try:
-            async with httpx.AsyncClient(timeout=self._config.yutori.timeout) as client:
-                response = await client.post(
-                    f"{self._config.yutori.base_url}/browse/agent",
-                    headers={
-                        "Authorization": f"Bearer {self._config.yutori.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "url": dashboard_url,
-                        "goal": (
-                            "Find the API key, access token, or secret key on this page. "
-                            "Look for input fields, code blocks, or 'copy' buttons. "
-                            "Return the key value exactly as shown."
-                        ),
-                        "extract": ["api_key", "api_token", "access_token", "secret_key"],
-                        "max_steps": 5,
-                    },
-                )
-                response.raise_for_status()
-                data: dict[str, Any] = response.json()
-                extracted: dict[str, Any] = data.get("extracted", {})
+            task_description = (
+                f"Find the API key, access token, or secret key on this {tool_name} page. "
+                f"Look for:\n"
+                f"- Input fields or code blocks containing long alphanumeric strings\n"
+                f"- 'Copy' or 'Show' buttons next to API keys\n"
+                f"- A 'Create API Key' or 'Generate Key' button — click it if needed\n"
+                f"- Settings or API sections in the navigation\n\n"
+                f"Return the API key value exactly as shown."
+            )
 
-                for field in ("api_key", "api_token", "access_token", "secret_key"):
-                    if extracted.get(field):
-                        return str(extracted[field])
+            output_schema = {
+                "type": "object",
+                "properties": {
+                    "api_key": {
+                        "type": "string",
+                        "description": "The API key, access token, or secret key value",
+                    },
+                    "key_name": {
+                        "type": "string",
+                        "description": "The label or name of the key",
+                    },
+                    "dashboard_url": {
+                        "type": "string",
+                        "description": "Current page URL",
+                    },
+                },
+            }
+
+            create_resp = await self._create_task(
+                start_url=dashboard_url,
+                task=task_description,
+                output_schema=output_schema,
+                max_steps=15,
+            )
+
+            view_url = create_resp.get("view_url", "")
+            task_id = create_resp.get("task_id", "")
+
+            if task_id:
+                if self._bus:
+                    await self._emit("extract", f"Yutori extracting key... Watch: {view_url}", {"view_url": view_url})
+
+                result = await self._poll_task(task_id, timeout=90)
+
+                if result.get("status") == "succeeded":
+                    # Check structured result first
+                    structured = result.get("structured_result") or {}
+                    if isinstance(structured, dict) and structured.get("api_key"):
+                        return structured["api_key"], view_url
+
+                    # Check plain text result for key patterns
+                    text_result = result.get("result", "")
+                    if text_result:
+                        key = self._extract_key_from_text(text_result)
+                        if key:
+                            return key, view_url
+
+            return None, view_url
+
         except Exception as exc:
             logger.debug("Yutori key extraction failed: %s", exc)
+            return None, ""
 
-        return None
-
-    async def _extract_key_via_regex(self, page_url: str) -> str | None:
-        """Fetch a page directly and scan for API key patterns via regex.
-
-        Common patterns:
-          - ``tvly-...``  (Tavily)
-          - ``sk-...``    (OpenAI style)
-          - ``Bearer ...``
-          - Long hex/base64 tokens in form inputs
-
-        Args:
-            page_url: URL to fetch and scan.
-
-        Returns:
-            First matching API key, or ``None``.
-        """
+    def _extract_key_from_text(self, text: str) -> str | None:
+        """Extract an API key from text using common patterns."""
         patterns = [
-            # Labelled key patterns — value in group 1
             r'(?:api[_-]?key|access[_-]?token|secret[_-]?key)["\s:=]+([A-Za-z0-9_\-\.]{20,})',
-            # OpenAI-style
-            r'\b(sk-[A-Za-z0-9]{20,})\b',
-            # Tavily-style
-            r'\b(tvly-[A-Za-z0-9]{20,})\b',
-            # Generic long token
-            r'value=["\']([A-Za-z0-9_\-\.]{32,})["\']',
+            r'\b(sk-[A-Za-z0-9_\-]{20,})\b',
+            r'\b(tvly-[A-Za-z0-9_\-]{20,})\b',
+            r'\b(yt_[A-Za-z0-9_\-]{20,})\b',
+            r'\b([A-Za-z0-9]{32,})\b',
         ]
-
-        try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                resp = await client.get(page_url, headers={"User-Agent": "HackForge/0.1"})
-                resp.raise_for_status()
-                page_text = resp.text
-
-            for pattern in patterns:
-                match = re.search(pattern, page_text, re.IGNORECASE)
-                if match:
-                    return match.group(1)
-        except Exception as exc:
-            logger.debug("Regex key extraction failed for %s: %s", page_url, exc)
-
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1)
         return None
 
     # ------------------------------------------------------------------
@@ -401,38 +492,36 @@ class AuthForgeEngine:
     # ------------------------------------------------------------------
 
     async def _store_credentials(self, tool_name: str, api_key: str) -> Path:
-        """Persist an API key into ``.claude/settings.json``.
+        """Persist an API key into ``.claude/settings.json`` and ``.env``.
 
-        The key is stored under ``env`` using the conventional naming scheme
-        ``TOOLNAME_API_KEY`` (uppercase, spaces replaced with underscores).
-
-        Args:
-            tool_name: Human-readable tool name (e.g. ``"My Tool"``).
-            api_key: The API key to store.
-
-        Returns:
-            Path to the settings file that was written.
+        The key is stored using the conventional naming scheme
+        ``TOOLNAME_API_KEY`` (uppercase, spaces/hyphens → underscores).
         """
         env_key = f"{tool_name.upper().replace(' ', '_').replace('-', '_')}_API_KEY"
-        settings_path = self._config.project_root / ".claude" / "settings.json"
 
-        # Load or create the settings structure
+        # --- Update .claude/settings.json ---
+        settings_path = self._config.project_root / ".claude" / "settings.json"
         settings: dict[str, Any] = {}
         if settings_path.exists():
             try:
                 settings = json.loads(settings_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError) as exc:
-                logger.warning("Could not parse existing settings.json: %s", exc)
+                logger.warning("Could not parse settings.json: %s", exc)
 
-        # Merge the new key
         env_section: dict[str, str] = settings.setdefault("env", {})
         env_section[env_key] = api_key
 
-        # Write back
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(
-            json.dumps(settings, indent=2), encoding="utf-8"
-        )
+        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+        # --- Also append to .env if not already present ---
+        env_path = self._config.project_root / ".env"
+        if env_path.exists():
+            env_content = env_path.read_text(encoding="utf-8")
+            if f"{env_key}=" not in env_content:
+                with open(env_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n# {tool_name} — auto-acquired by AuthForge\n")
+                    f.write(f"{env_key}={api_key}\n")
 
         logger.info("Stored %s=%s... in %s", env_key, api_key[:8], settings_path)
         return settings_path
@@ -442,22 +531,13 @@ class AuthForgeEngine:
     # ------------------------------------------------------------------
 
     def _get_user_email(self) -> str:
-        """Retrieve the configured user email for signup forms.
-
-        Checks ``.claude/settings.json`` for a ``USER_EMAIL`` entry, then
-        falls back to the ``USER_EMAIL`` environment variable.
-
-        Returns:
-            Email string, or a placeholder if not configured.
-        """
+        """Retrieve the configured user email for signup forms."""
         import os
 
-        # Try env first
         email = os.environ.get("USER_EMAIL", "")
         if email:
             return email
 
-        # Try settings.json
         settings_path = self._config.project_root / ".claude" / "settings.json"
         if settings_path.exists():
             try:
@@ -468,8 +548,4 @@ class AuthForgeEngine:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        logger.warning(
-            "USER_EMAIL not configured — using placeholder for signup forms. "
-            "Set USER_EMAIL in .claude/settings.json or as an environment variable."
-        )
-        return "hackforge-user@example.com"
+        return "borg-agent@hackforge.dev"

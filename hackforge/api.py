@@ -438,6 +438,8 @@ DEMO_HTML = """<!DOCTYPE html>
   .card-btn-research:hover { background: rgba(33,150,243,0.3); }
   .card-btn-integrate { background: rgba(76,175,80,0.15); color: var(--green); }
   .card-btn-integrate:hover { background: rgba(76,175,80,0.3); }
+  .card-btn-getkey { background: rgba(255,193,7,0.15); color: #FFD54F; }
+  .card-btn-getkey:hover { background: rgba(255,193,7,0.3); }
   .card-btn-dismiss { background: rgba(255,255,255,0.05); color: var(--muted); }
   .card-btn-dismiss:hover { background: rgba(244,67,54,0.15); color: var(--red); }
   .card.integrated { border-color: var(--green); opacity: 0.7; }
@@ -474,6 +476,7 @@ DEMO_HTML = """<!DOCTYPE html>
   .engine-tool_forge  { background: rgba(33,150,243,0.15); color: var(--accent2); }
   .engine-agent       { background: rgba(168,85,247,0.15); color: #a855f7; }
   .engine-video_intel { background: rgba(156,39,176,0.15); color: #9C27B0; }
+  .engine-auth_forge  { background: rgba(255,193,7,0.15); color: #FFD54F; }
   .activity-msg { color: var(--text); flex: 1; }
   .activity-msg .highlight { color: #fff; font-weight: 600; }
 
@@ -722,6 +725,7 @@ DEMO_HTML = """<!DOCTYPE html>
       <p style="font-size:13px;color:var(--muted);margin-top:8px">Researching with Tavily + Reka AI...</p>
     </div>
     <div class="modal-actions" id="modal-actions">
+      <button class="btn" style="background:rgba(255,193,7,0.15);color:#FFD54F" onclick="getToolKey()">Get API Key</button>
       <button class="btn btn-integrate" onclick="integrateTool()">Integrate into Harness</button>
       <button class="btn btn-dismiss" onclick="dismissTool()">Dismiss</button>
     </div>
@@ -816,6 +820,7 @@ function renderDiscoverResults(data) {
         ${caps ? `<div class="caps">${caps}</div>` : ''}
         <div class="card-actions">
           <button class="card-btn card-btn-research" onclick='event.stopPropagation();openToolModal(${JSON.stringify(tool).replace(/'/g,"&#39;")})'>Research</button>
+          <button class="card-btn card-btn-getkey" onclick="event.stopPropagation();quickGetKey('${esc(tool.name)}','${esc(tool.api_url || tool.vendor || tool.name)}')">Get Key</button>
           <button class="card-btn card-btn-integrate" onclick="event.stopPropagation();quickIntegrate('${esc(tool.name)}')">Integrate</button>
           <button class="card-btn card-btn-dismiss" onclick="event.stopPropagation();quickDismiss('${esc(tool.name)}',${i})">Dismiss</button>
         </div>
@@ -1183,6 +1188,85 @@ async function dismissTool() {
     });
   } catch(e) {
     alert('Dismiss failed: ' + e.message);
+  }
+}
+
+async function quickGetKey(name, vendorUrl) {
+  try {
+    // Find the button and show loading state
+    document.querySelectorAll('.card').forEach(card => {
+      if (card.querySelector('.card-name')?.textContent === name) {
+        const btn = card.querySelector('.card-btn-getkey');
+        if (btn) { btn.textContent = 'Acquiring...'; btn.disabled = true; }
+      }
+    });
+    // Switch to Activity tab to watch progress
+    switchTab('activity');
+
+    const res = await fetch('/api/auth-tool', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({tool_name: name, vendor_url: vendorUrl})
+    });
+    const data = await res.json();
+
+    if (data.view_url) {
+      window.open(data.view_url, '_blank');
+    }
+
+    document.querySelectorAll('.card').forEach(card => {
+      if (card.querySelector('.card-name')?.textContent === name) {
+        const btn = card.querySelector('.card-btn-getkey');
+        if (btn) {
+          if (data.setup_complete) {
+            btn.textContent = 'Key Acquired';
+            btn.style.background = 'rgba(76,175,80,0.3)';
+            btn.style.color = 'var(--green)';
+          } else {
+            btn.textContent = 'Get Key';
+            btn.disabled = false;
+            if (data.manual_steps && data.manual_steps.length > 0) {
+              alert('Manual steps needed:\\n' + data.manual_steps.join('\\n'));
+            }
+          }
+        }
+      }
+    });
+  } catch(e) {
+    alert('Auth failed: ' + e.message);
+    document.querySelectorAll('.card-btn-getkey').forEach(b => { b.textContent = 'Get Key'; b.disabled = false; });
+  }
+}
+
+async function getToolKey() {
+  const name = document.getElementById('modal-title')?.textContent || '';
+  const vendorUrl = document.getElementById('modal-url')?.textContent || name;
+  const actionsEl = document.getElementById('modal-actions');
+  if (actionsEl) {
+    actionsEl.innerHTML = '<div class="spinner" style="width:20px;height:20px;display:inline-block"></div> <span style="color:#FFD54F">Yutori acquiring API key...</span>';
+  }
+  switchTab('activity');
+  try {
+    const res = await fetch('/api/auth-tool', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({tool_name: name, vendor_url: vendorUrl})
+    });
+    const data = await res.json();
+
+    if (data.view_url) {
+      window.open(data.view_url, '_blank');
+    }
+
+    if (data.setup_complete) {
+      actionsEl.innerHTML = '<span style="color:var(--green);font-weight:600">API key acquired and stored!</span>';
+    } else {
+      let msg = 'Could not auto-acquire key.';
+      if (data.manual_steps && data.manual_steps.length > 0) {
+        msg += ' ' + data.manual_steps[0];
+      }
+      actionsEl.innerHTML = '<span style="color:#FFD54F">' + esc(msg) + '</span>';
+    }
+  } catch(e) {
+    actionsEl.innerHTML = '<span style="color:var(--red)">Auth failed: ' + esc(e.message) + '</span>';
   }
 }
 
@@ -1788,6 +1872,40 @@ async def research_tool(req: ResearchToolRequest) -> dict[str, Any]:
         results["status"] = "failed"
 
     return results
+
+
+@app.post("/api/auth-tool")
+async def auth_tool(body: dict[str, Any]) -> dict[str, Any]:
+    """Trigger AuthForge to acquire an API key for a tool via Yutori browser agent."""
+    from hackforge.config import HackForgeConfig
+    from hackforge.engines.auth_forge import AuthForgeEngine
+
+    tool_name = body.get("tool_name", "")
+    vendor_url = body.get("vendor_url", "")
+
+    if not tool_name:
+        return {"error": "tool_name is required"}
+
+    cfg = HackForgeConfig.load()
+
+    await pipeline_bus.emit_step(
+        "auth_forge", "start",
+        f"AuthForge: acquiring API key for {tool_name}...",
+    )
+
+    engine = AuthForgeEngine(cfg, bus=pipeline_bus)
+    result = await engine.setup_tool(tool_name, vendor_url or tool_name)
+
+    return {
+        "tool_name": result.tool_name,
+        "setup_complete": result.setup_complete,
+        "api_key_preview": result.api_key[:12] + "..." if result.api_key else "",
+        "auth_type": result.auth_type,
+        "view_url": result.view_url,
+        "dashboard_url": result.dashboard_url,
+        "manual_steps": result.manual_steps,
+        "error": result.error,
+    }
 
 
 @app.post("/api/integrate-tool")
