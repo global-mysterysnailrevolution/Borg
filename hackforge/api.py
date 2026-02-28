@@ -476,6 +476,20 @@ DEMO_HTML = """<!DOCTYPE html>
   .activity-msg { color: var(--text); flex: 1; }
   .activity-msg .highlight { color: #fff; font-weight: 600; }
 
+  /* ── Demo narration ────────────────────────────────────── */
+  #demo-narration {
+    display: none; position: fixed; bottom: 32px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.92); border: 1px solid rgba(168,85,247,0.5);
+    border-radius: 12px; padding: 16px 28px; z-index: 2000;
+    max-width: 600px; text-align: center; backdrop-filter: blur(12px);
+    box-shadow: 0 8px 32px rgba(168,85,247,0.2);
+  }
+  #demo-narration.show { display: block; animation: fadeUp 0.4s ease; }
+  @keyframes fadeUp { from { opacity:0; transform: translateX(-50%) translateY(20px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
+  #demo-narration h3 { font-size: 15px; color: #a855f7; margin-bottom: 4px; font-weight: 700; }
+  #demo-narration p { font-size: 13px; color: var(--text); line-height: 1.5; }
+  .demo-step-num { color: #a855f7; font-weight: 800; font-size: 18px; margin-right: 6px; }
+
   /* ── Loading / error ─────────────────────────────────────── */
   .spinner {
     display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3);
@@ -503,7 +517,13 @@ DEMO_HTML = """<!DOCTYPE html>
       <p>Autonomous Tool Discovery &amp; Integration — Resistance is Futile</p>
     </div>
   </div>
-  <span class="badge">Live Demo</span>
+  <div style="display:flex;gap:10px;align-items:center">
+    <button class="btn" id="demo-btn" onclick="runDemo()" style="background:linear-gradient(135deg,#a855f7,#6d28d9);padding:8px 20px;font-size:13px">
+      <span id="demo-label">&#9654; Auto Demo</span>
+      <span id="demo-spinner" class="spinner" style="display:none"></span>
+    </button>
+    <span class="badge">Live</span>
+  </div>
 </header>
 
 <nav class="tabs">
@@ -706,6 +726,8 @@ DEMO_HTML = """<!DOCTYPE html>
     </div>
   </div>
 </div>
+
+<div id="demo-narration"><h3 id="narr-title"></h3><p id="narr-text"></p></div>
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────
@@ -1190,6 +1212,158 @@ async function quickDismiss(name, idx) {
     const card = document.getElementById('card-' + idx);
     if (card) card.classList.add('dismissed');
   } catch(e) { alert('Dismiss failed: ' + e.message); }
+}
+
+// ── Auto Demo ──────────────────────────────────────────────────────────────
+let demoRunning = false;
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function narrate(title, text) {
+  const el = document.getElementById('demo-narration');
+  document.getElementById('narr-title').innerHTML = title;
+  document.getElementById('narr-text').innerHTML = text;
+  el.classList.add('show');
+}
+
+function hideNarration() {
+  document.getElementById('demo-narration').classList.remove('show');
+}
+
+async function typeText(input, text, speed = 45) {
+  input.value = '';
+  input.focus();
+  for (let i = 0; i < text.length; i++) {
+    input.value += text[i];
+    input.dispatchEvent(new Event('input'));
+    await sleep(speed + Math.random() * 30);
+  }
+}
+
+async function runDemo() {
+  if (demoRunning) return;
+  demoRunning = true;
+  const btn = document.getElementById('demo-btn');
+  btn.disabled = true;
+  document.getElementById('demo-label').style.opacity = '0.5';
+  document.getElementById('demo-label').textContent = 'Running Demo...';
+
+  try {
+    // ── Step 1: Intro ──
+    narrate(
+      '<span class="demo-step-num">1</span> The Borg — Tool Discovery',
+      'Paste any URL. The Borg autonomously discovers, researches, and integrates every tool mentioned. Let\'s analyze a hackathon page...'
+    );
+    await sleep(4000);
+
+    // ── Step 2: Type URL ──
+    showTab('discover');
+    await sleep(500);
+    narrate(
+      '<span class="demo-step-num">2</span> Scraping a Hackathon Page',
+      'Tavily deep-scrapes the page, then Fastino/Reka extract tool entities, and each gets deep-researched.'
+    );
+    const urlInput = document.getElementById('url-input');
+    await typeText(urlInput, 'https://lu.ma/sfagents');
+    await sleep(1500);
+
+    // ── Step 3: Switch to Activity ──
+    showTab('activity');
+    await sleep(500);
+    narrate(
+      '<span class="demo-step-num">3</span> Live Pipeline — Activity Feed',
+      'Every step streams here in real time via SSE. Watch the pipeline: scrape → extract → research → graph → compare.'
+    );
+    clearActivity();
+    await sleep(1500);
+
+    // ── Step 4: Fire the analysis ──
+    showTab('discover');
+    await sleep(300);
+    // Click forge
+    document.getElementById('forge-btn').click();
+    await sleep(1000);
+
+    // Switch to activity to watch events
+    showTab('activity');
+    narrate(
+      '<span class="demo-step-num">4</span> Pipeline Running',
+      'Tavily is scraping... Fastino/Reka extracting entities... each tool gets deep-researched. Watch the events stream in.'
+    );
+
+    // Wait for analysis to finish (poll for results)
+    let waited = 0;
+    while (waited < 30000) {
+      await sleep(1000);
+      waited += 1000;
+      if (activityCount > 5) break;
+    }
+    await sleep(3000);
+
+    // ── Step 5: Show results ──
+    showTab('discover');
+    await sleep(500);
+    narrate(
+      '<span class="demo-step-num">5</span> Discovered Tools',
+      'Each tool gets a card with research data, capabilities, and an integration recommendation. Click any card to deep-dive.'
+    );
+    await sleep(5000);
+
+    // ── Step 6: Knowledge Graph ──
+    showTab('graph');
+    await sleep(1000);
+    narrate(
+      '<span class="demo-step-num">6</span> Knowledge Graph (Neo4j)',
+      '41 nodes, 49 relationships — tools, vendors, capabilities, and discovery events. All stored in Neo4j Aura with full traceability.'
+    );
+    await sleep(5000);
+
+    // ── Step 7: Sponsors ──
+    showTab('sponsors');
+    await sleep(500);
+    narrate(
+      '<span class="demo-step-num">7</span> 12 Sponsor Tools',
+      'All 12 hackathon sponsors integrated. Green = configured with live API keys. The Borg uses these tools to integrate more tools.'
+    );
+    await sleep(4000);
+
+    // ── Step 8: Integration ──
+    showTab('discover');
+    await sleep(500);
+    narrate(
+      '<span class="demo-step-num">8</span> Agentic Integration',
+      'Click "Integrate" and The Borg\'s AI agent generates a complete MCP server — server.py, client.py, config — and wires it into the harness. All autonomous.'
+    );
+    await sleep(5000);
+
+    // ── Step 9: Activity recap ──
+    showTab('activity');
+    await sleep(500);
+    narrate(
+      '<span class="demo-step-num">9</span> Full Observability',
+      'Every discovery, research, and integration step is logged and streamed. The graph provides full audit trail. Resistance is futile.'
+    );
+    await sleep(5000);
+
+    // ── Done ──
+    hideNarration();
+    await sleep(500);
+    narrate(
+      'Demo Complete',
+      'The Borg — Autonomous Tool Discovery & Integration. Built at the SF Autonomous Agents Hackathon 2025.'
+    );
+    await sleep(4000);
+    hideNarration();
+
+  } catch(e) {
+    console.error('Demo error:', e);
+    hideNarration();
+  } finally {
+    demoRunning = false;
+    btn.disabled = false;
+    document.getElementById('demo-label').style.opacity = '1';
+    document.getElementById('demo-label').textContent = '\u25B6 Auto Demo';
+  }
 }
 
 // ── Activity Feed (SSE) ─────────────────────────────────────────────────────
