@@ -477,6 +477,7 @@ DEMO_HTML = """<!DOCTYPE html>
   .engine-agent       { background: rgba(168,85,247,0.15); color: #a855f7; }
   .engine-video_intel { background: rgba(156,39,176,0.15); color: #9C27B0; }
   .engine-auth_forge  { background: rgba(255,193,7,0.15); color: #FFD54F; }
+  .engine-research    { background: rgba(0,188,212,0.15); color: #00BCD4; }
   .activity-msg { color: var(--text); flex: 1; }
   .activity-msg .highlight { color: #fff; font-weight: 600; }
 
@@ -711,6 +712,14 @@ DEMO_HTML = """<!DOCTYPE html>
     <div class="section" id="modal-sources-section" style="display:none">
       <h3>Sources</h3>
       <ul class="source-list" id="modal-sources"></ul>
+    </div>
+    <div class="section" id="modal-subtools-section" style="display:none">
+      <h3>Sub-Tools / APIs Discovered</h3>
+      <div id="modal-subtools" style="display:grid;grid-template-columns:1fr 1fr;gap:8px"></div>
+    </div>
+    <div class="section" id="modal-auth-section" style="display:none">
+      <h3>Auth Details</h3>
+      <div id="modal-auth-info" style="display:flex;gap:8px;flex-wrap:wrap"></div>
     </div>
     <div class="section" id="modal-integration-section" style="display:none">
       <h3>Integration Guides</h3>
@@ -1038,6 +1047,7 @@ async function openToolModal(tool) {
 
   // Reset sections
   ['modal-summary-section','modal-answer-section','modal-caps-section',
+   'modal-subtools-section','modal-auth-section',
    'modal-sources-section','modal-integration-section','modal-history-section'].forEach(
     id => document.getElementById(id).style.display = 'none'
   );
@@ -1102,6 +1112,33 @@ async function openToolModal(tool) {
         `<li><a href="${esc(s.url)}" target="_blank">${esc(s.title)}</a><div class="source-snippet">${esc(s.snippet)}</div></li>`
       ).join('');
       document.getElementById('modal-integration-section').style.display = 'block';
+    }
+
+    // Sub-tools / APIs
+    if (research.sub_tools && research.sub_tools.length) {
+      document.getElementById('modal-subtools').innerHTML = research.sub_tools.map(st =>
+        `<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px">
+          <div style="font-weight:600;color:var(--accent2);font-size:13px">${esc(st.name)}</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">${esc(st.description || '')}</div>
+          ${st.endpoint ? '<div style="font-size:10px;color:#FFD54F;margin-top:4px;font-family:monospace">' + esc(st.endpoint) + '</div>' : ''}
+        </div>`
+      ).join('');
+      document.getElementById('modal-subtools-section').style.display = 'block';
+    }
+
+    // Auth info
+    if (research.auth_info) {
+      const ai = research.auth_info;
+      let badges = '';
+      if (ai.auth_method) badges += '<span class="cap" style="background:rgba(255,193,7,0.15);color:#FFD54F">Auth: ' + esc(ai.auth_method) + '</span>';
+      if (ai.google_sso === 'yes') badges += '<span class="cap" style="background:rgba(76,175,80,0.15);color:var(--green)">Google SSO</span>';
+      if (ai.free_tier === 'yes') badges += '<span class="cap" style="background:rgba(33,150,243,0.15);color:var(--accent2)">Free Tier</span>';
+      if (ai.free_tier === 'no') badges += '<span class="cap" style="background:rgba(244,67,54,0.15);color:var(--red)">No Free Tier</span>';
+      if (ai.signup_url) badges += '<a href="' + esc(ai.signup_url) + '" target="_blank" class="cap" style="background:rgba(168,85,247,0.15);color:#a855f7;text-decoration:none">Signup Link</a>';
+      if (badges) {
+        document.getElementById('modal-auth-info').innerHTML = badges;
+        document.getElementById('modal-auth-section').style.display = 'block';
+      }
     }
 
     // Capabilities from Neo4j
@@ -1201,7 +1238,7 @@ async function quickGetKey(name, vendorUrl) {
       }
     });
     // Switch to Activity tab to watch progress
-    switchTab('activity');
+    showTab('activity');
 
     const res = await fetch('/api/auth-tool', {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1244,7 +1281,7 @@ async function getToolKey() {
   if (actionsEl) {
     actionsEl.innerHTML = '<div class="spinner" style="width:20px;height:20px;display:inline-block"></div> <span style="color:#FFD54F">Yutori acquiring API key...</span>';
   }
-  switchTab('activity');
+  showTab('activity');
   try {
     const res = await fetch('/api/auth-tool', {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1787,49 +1824,198 @@ async def sponsors() -> list[dict[str, Any]]:
     return result
 
 
+def _parse_sub_tools(ai_text: str, parent_name: str) -> list[dict[str, str]]:
+    """Parse sub-tools/APIs from Reka's analysis. Handles multiple markdown formats."""
+    import re as _re
+    sub_tools: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    # Reject names that are clearly not tool/API names
+    _reject = {
+        "name", "what it does", "endpoint pattern", "key parameters",
+        "auth method", "signup url", "supports", "free tier",
+        "has python sdk", "pip install command", "has mcp server",
+        "how to run it", "rest api base url", "key headers needed",
+        "additional notes", "pricing", "summary", "what it does**",
+        "name**", "endpoint pattern**", "key parameters**",
+    }
+
+    def _add(name: str, desc: str, endpoint: str = "") -> None:
+        key = name.lower().strip().rstrip("*:")
+        # Reject noise
+        if not key or key in seen or len(name) > 60 or len(name) < 3:
+            return
+        if key in _reject or key.startswith("`") or "**" in name:
+            return
+        # Reject if name looks like a parameter (starts with backtick content)
+        if name.startswith("`") or name.startswith('"'):
+            return
+        sub_tools.append({"name": name, "description": desc[:200], "endpoint": endpoint, "params": ""})
+        seen.add(key)
+
+    # 1. Bold items: "- **Name**: desc" or "- **Name:** desc"
+    for m in _re.finditer(r'[-*]\s+\*\*(.+?)\*\*[:\s]*(.+?)(?:\n|$)', ai_text):
+        name = m.group(1).strip().rstrip(":")
+        desc = m.group(2).strip()
+        ep = _re.search(r'((?:GET|POST|PUT|DELETE|PATCH)\s+/\S+)', desc)
+        _add(name, desc, ep.group(1) if ep else "")
+
+    # 2. Backtick names: "`search` - does searching"
+    for m in _re.finditer(r'`([A-Za-z_/\-]{2,}(?:\s+API)?)`[:\s\-]+(.+?)(?:\n|$)', ai_text):
+        _add(m.group(1).strip(), m.group(2).strip())
+
+    # 3. Endpoint patterns: "POST /v1/search"
+    for m in _re.finditer(r'((?:GET|POST|PUT|DELETE|PATCH)\s+/\S+)', ai_text):
+        ep = m.group(1).strip()
+        slug = ep.split()[-1].split("/")[-1].replace("-", " ").replace("_", " ").title()
+        _add(f"{slug} API", f"Endpoint: {ep}", ep)
+
+    # 4. Capabilities list items with parenthetical sub-items
+    cap_section = False
+    for line in ai_text.split("\n"):
+        s = line.strip()
+        if "capabilit" in s.lower() and any(c in s for c in ("key", "Key", "##", "**")):
+            cap_section = True
+            continue
+        if cap_section and s.startswith(("- ", "* ")):
+            text = s.lstrip("- *").strip()
+            paren = _re.search(r'\(([^)]+)\)', text)
+            if paren:
+                for item in paren.group(1).split(","):
+                    item = item.strip()
+                    if item and len(item) < 40:
+                        _add(item.title(), text)
+            elif len(text) < 80:
+                _add(text.split("(")[0].split(":")[0].strip()[:50], text)
+        elif cap_section and s.startswith(("#", "**")) and "capabilit" not in s.lower():
+            cap_section = False
+
+    return sub_tools
+
+
+def _parse_auth_info(ai_text: str) -> dict[str, str]:
+    """Parse auth details from Reka's analysis."""
+    import re as _re
+    info: dict[str, str] = {}
+    lower = ai_text.lower()
+    # Auth method
+    for method in ("api_key", "api key", "oauth", "bearer", "basic", "none"):
+        if method in lower:
+            info["auth_method"] = method.replace(" ", "_")
+            break
+    # Google SSO
+    if "sign in with google" in lower or "google oauth" in lower:
+        info["google_sso"] = "yes"
+    # Free tier
+    if "free tier" in lower:
+        info["free_tier"] = "yes"
+    elif "no free" in lower:
+        info["free_tier"] = "no"
+    # Signup URL
+    m = _re.search(r'signup[^:]*:\s*(https?://\S+)', ai_text, _re.IGNORECASE)
+    if m:
+        info["signup_url"] = m.group(1)
+    return info
+
+
 @app.post("/api/research-tool")
 async def research_tool(req: ResearchToolRequest) -> dict[str, Any]:
-    """Deep-research a discovered tool using Tavily and return enriched info."""
+    """Deep-research a discovered tool — maps full API surface, sub-tools, auth flow."""
     from hackforge.config import HackForgeConfig
     from hackforge.providers.tavily_client import TavilyClient
 
     cfg = HackForgeConfig.load()
     results: dict[str, Any] = {"name": req.name, "vendor": req.vendor}
 
+    await pipeline_bus.emit_step("research", "start", f"Deep-researching {req.name}...")
+
     try:
+        all_content: list[str] = []
+
         async with TavilyClient(cfg.tavily) as client:
-            # Search for API docs and capabilities
+            # 1. Core API docs and capabilities
+            await pipeline_bus.emit_step("research", "search", f"Tavily: searching {req.name} API docs...")
             resp = await client.search(
-                f"{req.name} API documentation pricing features free tier developer",
+                f"{req.name} API documentation all endpoints features capabilities",
                 max_results=8,
                 search_depth="advanced",
             )
             results["answer"] = resp.answer or ""
             results["sources"] = [
-                {"title": r.title, "url": r.url, "snippet": r.content[:200]}
+                {"title": r.title, "url": r.url, "snippet": r.content[:300]}
                 for r in resp.results[:8]
             ]
+            all_content.extend(r.content[:500] for r in resp.results[:5])
+            await pipeline_bus.emit_step("research", "search", f"Found {len(resp.results)} sources for {req.name} API docs")
 
-            # Search for integration guides
+            # 2. Developer portal, signup, auth flow
+            await pipeline_bus.emit_step("research", "search", f"Tavily: searching {req.name} auth flow + developer portal...")
             resp2 = await client.search(
-                f"{req.name} MCP server integration SDK quickstart",
+                f"{req.name} developer portal signup API key authentication OAuth",
+                max_results=5,
+                search_depth="basic",
+            )
+            results["auth_sources"] = [
+                {"title": r.title, "url": r.url, "snippet": r.content[:200]}
+                for r in resp2.results[:5]
+            ]
+            all_content.extend(r.content[:300] for r in resp2.results[:3])
+
+            # 3. SDK, integration, MCP
+            await pipeline_bus.emit_step("research", "search", f"Tavily: searching {req.name} SDK + integration guides...")
+            resp3 = await client.search(
+                f"{req.name} Python SDK MCP server REST API integration quickstart",
                 max_results=5,
                 search_depth="basic",
             )
             results["integration_sources"] = [
                 {"title": r.title, "url": r.url, "snippet": r.content[:200]}
-                for r in resp2.results[:5]
+                for r in resp3.results[:5]
             ]
+            all_content.extend(r.content[:300] for r in resp3.results[:3])
 
-        # Try enriching with Reka
+            # 4. Pricing and free tier
+            await pipeline_bus.emit_step("research", "search", f"Tavily: searching {req.name} pricing + free tier...")
+            resp4 = await client.search(
+                f"{req.name} pricing free tier hackathon credits API limits",
+                max_results=3,
+                search_depth="basic",
+            )
+            all_content.extend(r.content[:300] for r in resp4.results[:2])
+
+        # 5. Use Reka to analyze everything and extract structured sub-tools
+        combined_text = "\n\n".join(all_content)
         if cfg.reka.api_key:
+            await pipeline_bus.emit_step("research", "analyze", f"Reka AI: analyzing {req.name} full API surface...")
             try:
                 import httpx
 
-                combined_text = results.get("answer", "") + " ".join(
-                    s["snippet"] for s in results.get("sources", [])
+                reka_prompt = (
+                    f"You are analyzing the tool/platform '{req.name}'. Based on the research below, "
+                    f"provide a DETAILED structured analysis. Be thorough.\n\n"
+                    f"## Required output:\n\n"
+                    f"### SUMMARY\n"
+                    f"One paragraph: what this tool does, who it's for, why it matters.\n\n"
+                    f"### SUB-TOOLS / APIs\n"
+                    f"List EVERY distinct API, endpoint, or feature this tool offers. For each:\n"
+                    f"- Name (e.g. 'Search API', 'Extract API', 'Chat Completions')\n"
+                    f"- What it does (1 sentence)\n"
+                    f"- Endpoint pattern if known (e.g. POST /v1/search)\n"
+                    f"- Key parameters\n\n"
+                    f"### AUTH\n"
+                    f"- Auth method: api_key / oauth / bearer / basic / none\n"
+                    f"- Signup URL if found\n"
+                    f"- Supports 'Sign in with Google'? yes/no/unknown\n"
+                    f"- Free tier available? yes/no + limits\n\n"
+                    f"### INTEGRATION\n"
+                    f"- Has Python SDK? Name + pip install command\n"
+                    f"- Has MCP server? If so, how to run it\n"
+                    f"- REST API base URL if known\n"
+                    f"- Key headers needed\n\n"
+                    f"Research:\n{combined_text[:4000]}"
                 )
-                async with httpx.AsyncClient(timeout=30) as http:
+
+                async with httpx.AsyncClient(timeout=45) as http:
                     reka_resp = await http.post(
                         f"{cfg.reka.base_url}/chat",
                         headers={
@@ -1838,38 +2024,88 @@ async def research_tool(req: ResearchToolRequest) -> dict[str, Any]:
                         },
                         json={
                             "model": "reka-flash",
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        f"Based on this research about '{req.name}', provide a structured summary:\n"
-                                        f"1. What it does (1 sentence)\n"
-                                        f"2. Key capabilities (bullet list)\n"
-                                        f"3. Auth type (api_key / oauth / none)\n"
-                                        f"4. Has free tier? (yes/no)\n"
-                                        f"5. How to integrate (MCP server possible? REST API?)\n\n"
-                                        f"Research:\n{combined_text[:3000]}"
-                                    ),
-                                }
-                            ],
+                            "messages": [{"role": "user", "content": reka_prompt}],
                         },
                     )
                     if reka_resp.status_code == 200:
                         reka_data = reka_resp.json()
-                        results["ai_summary"] = (
+                        ai_text = (
                             reka_data.get("responses", [{}])[0]
                             .get("message", {})
                             .get("content", "")
                         )
+                        results["ai_summary"] = ai_text
+                        await pipeline_bus.emit_step(
+                            "research", "analyze",
+                            f"Reka analysis complete: {len(ai_text)} chars"
+                        )
+
+                        # Parse sub-tools from the AI response
+                        sub_tools = _parse_sub_tools(ai_text, req.name)
+                        if sub_tools:
+                            results["sub_tools"] = sub_tools
+                            await pipeline_bus.emit_step(
+                                "research", "sub_tools",
+                                f"Found {len(sub_tools)} sub-tools/APIs for {req.name}: "
+                                + ", ".join(t["name"] for t in sub_tools[:5])
+                            )
+
+                        # Parse auth info
+                        auth_info = _parse_auth_info(ai_text)
+                        if auth_info:
+                            results["auth_info"] = auth_info
+                    else:
+                        await pipeline_bus.emit_error(
+                            "research", "analyze",
+                            f"Reka returned {reka_resp.status_code}"
+                        )
             except Exception as exc:
                 logger.warning("Reka enrichment failed: %s", exc)
+                await pipeline_bus.emit_error("research", "analyze", f"Reka failed: {exc}")
+
+        # 6. Store sub-tools in Neo4j
+        if results.get("sub_tools") and cfg.neo4j_password and cfg.neo4j_uri:
+            await pipeline_bus.emit_step("research", "graph", f"Storing {len(results['sub_tools'])} sub-tools in Neo4j...")
+            try:
+                from neo4j import AsyncGraphDatabase
+                driver = AsyncGraphDatabase.driver(cfg.neo4j_uri, auth=(cfg.neo4j_user, cfg.neo4j_password))
+                try:
+                    async with driver.session() as session:
+                        for st in results["sub_tools"]:
+                            await session.run(
+                                """
+                                MERGE (parent:Tool {name: $parent_name})
+                                MERGE (sub:SubTool {name: $name, parent: $parent_name})
+                                SET sub.description = $desc,
+                                    sub.endpoint = $endpoint,
+                                    sub.params = $params
+                                MERGE (parent)-[:HAS_API]->(sub)
+                                """,
+                                parent_name=req.name,
+                                name=st["name"],
+                                desc=st.get("description", ""),
+                                endpoint=st.get("endpoint", ""),
+                                params=st.get("params", ""),
+                            )
+                finally:
+                    await driver.close()
+                await pipeline_bus.emit_step("research", "graph", "Sub-tools stored in Neo4j")
+            except Exception as exc:
+                logger.warning("Neo4j sub-tool storage failed: %s", exc)
 
         results["status"] = "researched"
+        await pipeline_bus.emit_result(
+            "research", "complete",
+            f"Deep research complete for {req.name}: "
+            + f"{len(results.get('sub_tools', []))} sub-tools, "
+            + f"{len(results.get('sources', []))} sources"
+        )
 
     except Exception as exc:
         logger.exception("research_tool failed for %s", req.name)
         results["error"] = str(exc)
         results["status"] = "failed"
+        await pipeline_bus.emit_error("research", "error", f"Research failed: {exc}")
 
     return results
 

@@ -127,6 +127,8 @@ class AuthForgeEngine:
         if output_schema:
             payload["output_schema"] = output_schema
 
+        await self._emit("api", f"Yutori API: POST /browsing/tasks start_url={start_url} require_auth={require_auth} max_steps={max_steps}")
+
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{YUTORI_API}/browsing/tasks",
@@ -137,7 +139,9 @@ class AuthForgeEngine:
                 json=payload,
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            await self._emit("api", f"Yutori task created: id={data.get('task_id','')} view={data.get('view_url','')}")
+            return data
 
     async def _poll_task(
         self,
@@ -227,12 +231,20 @@ class AuthForgeEngine:
                     )
                 elif nav_status == "succeeded":
                     await self._emit("navigate", "Signup navigation completed successfully")
+                    nav_text = nav_data.get("result", "")
+                    if nav_text:
+                        await self._emit("navigate", f"Yutori result: {str(nav_text)[:200]}")
                     # Check if the nav result already contains an API key
                     structured = nav_data.get("structured_result") or {}
-                    if isinstance(structured, dict) and structured.get("api_key"):
-                        result.api_key = structured["api_key"]
-                        result.dashboard_url = structured.get("dashboard_url", "")
-                        await self._emit("extract", f"API key found during signup: {result.api_key[:8]}...")
+                    if isinstance(structured, dict):
+                        await self._emit("navigate", f"Structured data: {json.dumps(structured)[:300]}")
+                        candidate = structured.get("api_key", "")
+                        if candidate and self._is_valid_key(candidate):
+                            result.api_key = candidate
+                            result.dashboard_url = structured.get("dashboard_url", "")
+                            await self._emit("extract", f"API key found during signup: {result.api_key[:8]}...")
+                        elif candidate:
+                            await self._emit("navigate", f"Rejected invalid key candidate: {candidate[:30]}...")
                 else:
                     await self._emit_error("navigate", f"Signup navigation timed out")
                     result.manual_steps.append("Navigation timed out. Try again or sign up manually.")
@@ -240,24 +252,29 @@ class AuthForgeEngine:
             # Step 3: If we don't have a key yet, try extracting from dashboard
             if not result.api_key:
                 dashboard_url = result.dashboard_url or signup_url
-                await self._emit("extract", f"Extracting API key from {dashboard_url}...")
+                await self._emit("extract", f"Sending Yutori to extract API key from {dashboard_url}...")
                 api_key, extract_view_url = await self._extract_api_key(tool_name, dashboard_url)
 
                 if extract_view_url:
                     result.view_url = extract_view_url
+                    await self._emit("extract", f"Extraction task view: {extract_view_url}", {"view_url": extract_view_url})
 
-                if api_key:
+                if api_key and self._is_valid_key(api_key):
                     result.api_key = api_key
-                    await self._emit("extract", f"API key extracted: {api_key[:8]}...")
-                else:
-                    await self._emit_error("extract", "Could not auto-extract API key")
+                    await self._emit("extract", f"Valid API key extracted: {api_key[:12]}...")
+                elif api_key:
+                    await self._emit("extract", f"Rejected invalid extraction: {api_key[:40]}...")
+                    api_key = None
+
+                if not api_key:
+                    await self._emit_error("extract", f"Could not auto-extract API key for {tool_name}")
                     result.manual_steps.append(
                         f"Could not auto-extract API key. Log into {vendor_url}, "
                         "go to API settings, copy your key, and paste it in the .env file."
                     )
 
             # Step 4: Store the key if we got one
-            if result.api_key:
+            if result.api_key and self._is_valid_key(result.api_key):
                 await self._emit("store", f"Storing API key for {tool_name}...")
                 config_path = await self._store_credentials(tool_name, result.api_key)
                 result.config_path = str(config_path)
@@ -304,6 +321,7 @@ class AuthForgeEngine:
             async with httpx.AsyncClient(timeout=self._config.tavily.timeout) as client:
                 for query in queries:
                     try:
+                        await self._emit("search", f"Tavily: searching '{query}'")
                         resp = await client.post(
                             f"{self._config.tavily.base_url}/search",
                             json={
@@ -315,6 +333,10 @@ class AuthForgeEngine:
                         )
                         resp.raise_for_status()
                         data = resp.json()
+                        results = data.get("results", [])
+                        await self._emit("search", f"Tavily: {len(results)} results for '{query}'")
+                        for r in results[:3]:
+                            await self._emit("search", f"  -> {r.get('url', '')[:80]}")
 
                         for r in data.get("results", []):
                             url_lower = r.get("url", "").lower()
@@ -448,23 +470,41 @@ class AuthForgeEngine:
             task_id = create_resp.get("task_id", "")
 
             if task_id:
-                if self._bus:
-                    await self._emit("extract", f"Yutori extracting key... Watch: {view_url}", {"view_url": view_url})
+                await self._emit("extract", f"Yutori task {task_id} started. Watch: {view_url}", {"view_url": view_url})
 
                 result = await self._poll_task(task_id, timeout=90)
+                status = result.get("status", "unknown")
+                await self._emit("extract", f"Yutori extraction task status: {status}")
 
-                if result.get("status") == "succeeded":
-                    # Check structured result first
+                if status == "succeeded":
+                    # Log what Yutori returned
+                    text_result = result.get("result", "")
                     structured = result.get("structured_result") or {}
+                    await self._emit("extract", f"Yutori text result: {str(text_result)[:200]}")
+                    if structured:
+                        await self._emit("extract", f"Yutori structured result: {json.dumps(structured)[:300]}")
+
+                    # Check structured result first
                     if isinstance(structured, dict) and structured.get("api_key"):
-                        return structured["api_key"], view_url
+                        candidate = structured["api_key"]
+                        if self._is_valid_key(candidate):
+                            await self._emit("extract", f"Valid key from structured result: {candidate[:12]}...")
+                            return candidate, view_url
+                        else:
+                            await self._emit("extract", f"Rejected structured key: {candidate[:40]}")
 
                     # Check plain text result for key patterns
-                    text_result = result.get("result", "")
                     if text_result:
                         key = self._extract_key_from_text(text_result)
                         if key:
+                            await self._emit("extract", f"Valid key from text result: {key[:12]}...")
                             return key, view_url
+                        else:
+                            await self._emit("extract", "No valid key pattern found in text result")
+                elif status == "failed":
+                    await self._emit_error("extract", f"Yutori extraction failed: {result.get('result', 'unknown')}")
+                else:
+                    await self._emit_error("extract", f"Yutori extraction timed out (status: {status})")
 
             return None, view_url
 
@@ -472,19 +512,44 @@ class AuthForgeEngine:
             logger.debug("Yutori key extraction failed: %s", exc)
             return None, ""
 
+    def _is_valid_key(self, candidate: str) -> bool:
+        """Check if a string looks like a real API key vs page text garbage."""
+        if not candidate or len(candidate) < 16:
+            return False
+        # Reject if it contains spaces or looks like a sentence
+        if " " in candidate:
+            return False
+        # Reject common false positives
+        reject_phrases = [
+            "no valid", "not found", "could not", "invalid", "error",
+            "undefined", "null", "none", "example", "placeholder",
+            "your_api", "insert", "replace", "todo",
+        ]
+        lower = candidate.lower()
+        if any(phrase in lower for phrase in reject_phrases):
+            return False
+        # Must be mostly alphanumeric + common key chars
+        clean = candidate.replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+        if not clean.isalnum():
+            return False
+        return True
+
     def _extract_key_from_text(self, text: str) -> str | None:
         """Extract an API key from text using common patterns."""
         patterns = [
-            r'(?:api[_-]?key|access[_-]?token|secret[_-]?key)["\s:=]+([A-Za-z0-9_\-\.]{20,})',
+            r'(?:api[_-]?key|access[_-]?token|secret[_-]?key)["\s:=]+([A-Za-z0-9_\-\.:]{20,})',
             r'\b(sk-[A-Za-z0-9_\-]{20,})\b',
             r'\b(tvly-[A-Za-z0-9_\-]{20,})\b',
             r'\b(yt_[A-Za-z0-9_\-]{20,})\b',
-            r'\b([A-Za-z0-9]{32,})\b',
+            r'\b(rk_[A-Za-z0-9_\-]{20,})\b',
+            r'\b([A-Za-z0-9_\-\.:]{32,})\b',
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return match.group(1)
+                candidate = match.group(1)
+                if self._is_valid_key(candidate):
+                    return candidate
         return None
 
     # ------------------------------------------------------------------
