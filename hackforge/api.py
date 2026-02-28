@@ -252,6 +252,7 @@ DEMO_HTML = """<!DOCTYPE html>
     border-bottom: 1px solid var(--border);
     padding: 18px 32px;
     display: flex; align-items: center; justify-content: space-between;
+    position: relative; z-index: 100;
   }
   .logo { display: flex; align-items: center; gap: 12px; }
   .logo-icon {
@@ -518,7 +519,7 @@ DEMO_HTML = """<!DOCTYPE html>
     </div>
   </div>
   <div style="display:flex;gap:10px;align-items:center">
-    <button class="btn" id="demo-btn" onclick="runDemo()" style="background:linear-gradient(135deg,#a855f7,#6d28d9);padding:8px 20px;font-size:13px">
+    <button id="demo-btn" onclick="runDemo()" style="background:linear-gradient(135deg,#a855f7,#6d28d9);color:#fff;border:none;border-radius:8px;padding:10px 22px;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;z-index:200;position:relative">
       <span id="demo-label">&#9654; Auto Demo</span>
       <span id="demo-spinner" class="spinner" style="display:none"></span>
     </button>
@@ -1251,47 +1252,44 @@ async function runDemo() {
   try {
     // ── Step 1: Intro ──
     narrate(
-      '<span class="demo-step-num">1</span> The Borg — Tool Discovery',
-      'Paste any URL. The Borg autonomously discovers, researches, and integrates every tool mentioned. Let\'s analyze a hackathon page...'
+      "<span class='demo-step-num'>1</span> The Borg \u2014 Tool Discovery",
+      "Paste any URL. The Borg autonomously discovers, researches, and integrates every tool mentioned. Analyzing a hackathon page..."
     );
     await sleep(4000);
 
     // ── Step 2: Type URL ──
-    showTab('discover');
+    showTab("discover");
     await sleep(500);
     narrate(
-      '<span class="demo-step-num">2</span> Scraping a Hackathon Page',
-      'Tavily deep-scrapes the page, then Fastino/Reka extract tool entities, and each gets deep-researched.'
+      "<span class='demo-step-num'>2</span> Scraping a Hackathon Page",
+      "Tavily deep-scrapes the page, then Fastino/Reka extract tool entities, and each gets deep-researched."
     );
-    const urlInput = document.getElementById('url-input');
-    await typeText(urlInput, 'https://lu.ma/sfagents');
+    const urlInput = document.getElementById("url-input");
+    await typeText(urlInput, "https://lu.ma/sfagents");
     await sleep(1500);
 
     // ── Step 3: Switch to Activity ──
-    showTab('activity');
+    showTab("activity");
     await sleep(500);
     narrate(
-      '<span class="demo-step-num">3</span> Live Pipeline — Activity Feed',
-      'Every step streams here in real time via SSE. Watch the pipeline: scrape → extract → research → graph → compare.'
+      "<span class='demo-step-num'>3</span> Live Pipeline \u2014 Activity Feed",
+      "Every step streams here in real time via SSE. Watch the pipeline: scrape \u2192 extract \u2192 research \u2192 graph \u2192 compare."
     );
     clearActivity();
     await sleep(1500);
 
     // ── Step 4: Fire the analysis ──
-    showTab('discover');
+    showTab("discover");
     await sleep(300);
-    // Click forge
-    document.getElementById('forge-btn').click();
+    document.getElementById("forge-btn").click();
     await sleep(1000);
 
-    // Switch to activity to watch events
-    showTab('activity');
+    showTab("activity");
     narrate(
-      '<span class="demo-step-num">4</span> Pipeline Running',
-      'Tavily is scraping... Fastino/Reka extracting entities... each tool gets deep-researched. Watch the events stream in.'
+      "<span class='demo-step-num'>4</span> Pipeline Running",
+      "Tavily is scraping... Fastino/Reka extracting entities... each tool gets deep-researched. Watch the events stream in."
     );
 
-    // Wait for analysis to finish (poll for results)
     let waited = 0;
     while (waited < 30000) {
       await sleep(1000);
@@ -1301,47 +1299,47 @@ async function runDemo() {
     await sleep(3000);
 
     // ── Step 5: Show results ──
-    showTab('discover');
+    showTab("discover");
     await sleep(500);
     narrate(
-      '<span class="demo-step-num">5</span> Discovered Tools',
-      'Each tool gets a card with research data, capabilities, and an integration recommendation. Click any card to deep-dive.'
+      "<span class='demo-step-num'>5</span> Discovered Tools",
+      "Each tool gets a card with research data, capabilities, and an integration recommendation. Click any card to deep-dive."
     );
     await sleep(5000);
 
     // ── Step 6: Knowledge Graph ──
-    showTab('graph');
+    showTab("graph");
     await sleep(1000);
     narrate(
-      '<span class="demo-step-num">6</span> Knowledge Graph (Neo4j)',
-      '41 nodes, 49 relationships — tools, vendors, capabilities, and discovery events. All stored in Neo4j Aura with full traceability.'
+      "<span class='demo-step-num'>6</span> Knowledge Graph (Neo4j)",
+      "41 nodes, 49 relationships \u2014 tools, vendors, capabilities, and discovery events. All stored in Neo4j Aura with full traceability."
     );
     await sleep(5000);
 
     // ── Step 7: Sponsors ──
-    showTab('sponsors');
+    showTab("sponsors");
     await sleep(500);
     narrate(
-      '<span class="demo-step-num">7</span> 12 Sponsor Tools',
-      'All 12 hackathon sponsors integrated. Green = configured with live API keys. The Borg uses these tools to integrate more tools.'
+      "<span class='demo-step-num'>7</span> 12 Sponsor Tools",
+      "All 12 hackathon sponsors integrated. Green = configured with live API keys. The Borg uses these tools to integrate more tools."
     );
     await sleep(4000);
 
     // ── Step 8: Integration ──
-    showTab('discover');
+    showTab("discover");
     await sleep(500);
     narrate(
-      '<span class="demo-step-num">8</span> Agentic Integration',
-      'Click "Integrate" and The Borg\'s AI agent generates a complete MCP server — server.py, client.py, config — and wires it into the harness. All autonomous.'
+      "<span class='demo-step-num'>8</span> Agentic Integration",
+      "Click Integrate and the AI agent generates a complete MCP server \u2014 server.py, client.py, config \u2014 and wires it into the harness. All autonomous."
     );
     await sleep(5000);
 
     // ── Step 9: Activity recap ──
-    showTab('activity');
+    showTab("activity");
     await sleep(500);
     narrate(
-      '<span class="demo-step-num">9</span> Full Observability',
-      'Every discovery, research, and integration step is logged and streamed. The graph provides full audit trail. Resistance is futile.'
+      "<span class='demo-step-num'>9</span> Full Observability",
+      "Every discovery, research, and integration step is logged and streamed. The graph provides full audit trail. Resistance is futile."
     );
     await sleep(5000);
 
@@ -1349,8 +1347,8 @@ async function runDemo() {
     hideNarration();
     await sleep(500);
     narrate(
-      'Demo Complete',
-      'The Borg — Autonomous Tool Discovery & Integration. Built at the SF Autonomous Agents Hackathon 2025.'
+      "Demo Complete",
+      "The Borg \u2014 Autonomous Tool Discovery and Integration. Built at the SF Autonomous Agents Hackathon 2025."
     );
     await sleep(4000);
     hideNarration();
@@ -1362,7 +1360,7 @@ async function runDemo() {
     demoRunning = false;
     btn.disabled = false;
     document.getElementById('demo-label').style.opacity = '1';
-    document.getElementById('demo-label').textContent = '\u25B6 Auto Demo';
+    document.getElementById("demo-label").textContent = "\u25B6 Auto Demo";
   }
 }
 

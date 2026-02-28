@@ -404,7 +404,7 @@ class LinkIntelEngine:
         try:
             async with httpx.AsyncClient(timeout=self._config.reka.timeout) as client:
                 response = await client.post(
-                    f"{self._config.reka.base_url}/chat/completions",
+                    f"{self._config.reka.base_url}/chat",
                     headers={
                         "Authorization": f"Bearer {self._config.reka.api_key}",
                         "Content-Type": "application/json",

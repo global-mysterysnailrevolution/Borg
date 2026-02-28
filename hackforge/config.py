@@ -1,6 +1,6 @@
 """Centralized configuration for HackForge.
 
-Loads API keys and settings from environment variables and .claude/settings.json.
+Loads API keys and settings from environment variables, .env, and .claude/settings.json.
 """
 
 from __future__ import annotations
@@ -9,6 +9,11 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except ImportError:
+    _load_dotenv = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -52,9 +57,14 @@ class HackForgeConfig:
 
     @classmethod
     def load(cls, project_root: Path | None = None) -> HackForgeConfig:
-        """Load config from environment and .claude/settings.json."""
+        """Load config from environment, .env, and .claude/settings.json."""
         root = project_root or Path.cwd()
         cfg = cls(project_root=root)
+
+        # Load .env file if python-dotenv is available
+        env_path = root / ".env"
+        if _load_dotenv and env_path.exists():
+            _load_dotenv(env_path, override=False)
 
         # Try loading from .claude/settings.json
         settings_path = root / ".claude" / "settings.json"
